@@ -38,10 +38,10 @@ func main() {
 	kvs := client.NewKvStore("")
 	c, err := fuse.Mount(
 		mountpoint,
-		fuse.FSName("helloworld"),
-		fuse.Subtype("hellofs"),
+		fuse.FSName("blobfs"),
+		fuse.Subtype("blobfs"),
 		fuse.LocalVolume(),
-		fuse.VolumeName("Hello world!"),
+		fuse.VolumeName("BlobFS"),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -68,7 +68,8 @@ type FS struct {
 }
 
 func (f *FS) Root() (fs.Node, error) {
-	root := &Dir{fs: f, Name: "_root"}
+	// FIXME load/store the root from kvs
+	root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
 	if err := root.Save(); err != nil {
 		return nil, err
 	}
@@ -82,22 +83,23 @@ type Dir struct {
 
 	Name     string
 	Hash     string
-	Children []*clientutil.Meta
+	Children map[string]*clientutil.Meta
 }
 
 func NewDir(fs *FS, meta *clientutil.Meta) *Dir {
 	d := &Dir{
-		fs:   fs,
-		meta: meta,
-		Name: meta.Name,
-		Hash: meta.Hash,
+		fs:       fs,
+		meta:     meta,
+		Name:     meta.Name,
+		Hash:     meta.Hash,
+		Children: map[string]*clientutil.Meta{},
 	}
 	for _, ref := range d.meta.Refs {
 		m, err := clientutil.NewMetaFromBlobStore(fs.bs, ref.(string))
 		if err != nil {
 			panic(err)
 		}
-		d.Children = append(d.Children, m)
+		d.Children[m.Hash] = m
 	}
 	return d
 }
@@ -109,14 +111,11 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	// FIXME uses map for children
-	for _, c := range d.Children {
-		if c.Name == name {
-			if c.IsFile() {
-				return NewFile(d.fs, c), nil
-			} else {
-				return NewDir(d.fs, c), nil
-			}
+	if c, ok := d.Children[name]; ok {
+		if c.IsFile() {
+			return NewFile(d.fs, c), nil
+		} else {
+			return NewDir(d.fs, c), nil
 		}
 	}
 	//if name == "hello" {
@@ -132,22 +131,30 @@ var dirDirs = []fuse.Dirent{
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	dirs := []fuse.Dirent{}
 	for _, c := range d.Children {
-		dirs = append(dirs, fuse.Dirent{
-			Inode: 1,
-			Name:  c.Name,
-			Type:  fuse.DT_Dir,
-		})
+		if c.IsDir() {
+			dirs = append(dirs, fuse.Dirent{
+				Inode: 1,
+				Name:  c.Name,
+				Type:  fuse.DT_Dir,
+			})
+		} else {
+			dirs = append(dirs, fuse.Dirent{
+				Inode: 2,
+				Name:  c.Name,
+				Type:  fuse.DT_File,
+			})
+		}
 	}
 	return dirs, nil
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	newdir := &Dir{Name: req.Name, fs: d.fs}
+	newdir := &Dir{Name: req.Name, fs: d.fs, Children: map[string]*clientutil.Meta{}}
 	if err := newdir.Save(); err != nil {
 		log.Printf("newdir err: %v", err)
 		return nil, err
 	}
-	d.Children = append(d.Children, newdir.meta)
+	d.Children[newdir.meta.Hash] = newdir.meta
 	log.Printf("%+v %+v", d, newdir)
 	d.meta.AddRef(newdir.Hash)
 	if err := d.Save(); err != nil {
@@ -202,7 +209,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	time.Sleep(100 * time.Millisecond)
 	f := NewFile(d.fs, m)
-	d.Children = append(d.Children, m)
+	d.Children[m.Hash] = m
 	d.meta.AddRef(m.Hash)
 	if err := d.Save(); err != nil {
 		return nil, nil, err
