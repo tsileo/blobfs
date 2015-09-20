@@ -72,12 +72,26 @@ type FS struct {
 }
 
 func (f *FS) Root() (fs.Node, error) {
-	// FIXME load/store the root from kvs
-	root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
-	if err := root.Save(); err != nil {
+	kv, err := f.kvs.Get("fs:root", -1)
+	switch err {
+	case nil:
+		m, err := clientutil.NewMetaFromBlobStore(f.bs, kv.Value)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("meta root: %+v", m)
+		root := NewDir(f, m, nil)
+		return root, nil
+	case client.ErrKeyNotFound:
+		log.Printf("Creating root")
+		root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
+		if err := root.Save(); err != nil {
+			return nil, err
+		}
+		return root, nil
+	default:
 		return nil, err
 	}
-	return root, nil
 }
 
 // Dir implements both Node and Handle for the root directory.
@@ -99,6 +113,7 @@ func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) *Dir {
 		parent:   parent,
 		Children: map[string]*clientutil.Meta{},
 	}
+	log.Printf("new dir %+v", d)
 	for _, ref := range d.meta.Refs {
 		m, err := clientutil.NewMetaFromBlobStore(fs.bs, ref.(string))
 		if err != nil {
@@ -123,14 +138,7 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 			return NewDir(d.fs, c, d), nil
 		}
 	}
-	//if name == "hello" {
-	//	return File{}, nil
-	//}
 	return nil, fuse.ENOENT
-}
-
-var dirDirs = []fuse.Dirent{
-	{Inode: 2, Name: "hello", Type: fuse.DT_File},
 }
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
@@ -154,7 +162,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	newdir := &Dir{Name: req.Name, fs: d.fs, Children: map[string]*clientutil.Meta{}}
+	newdir := &Dir{Name: req.Name, fs: d.fs, Children: map[string]*clientutil.Meta{}, parent: d}
 	if err := newdir.Save(); err != nil {
 		log.Printf("newdir err: %v", err)
 		return nil, err
@@ -166,13 +174,11 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	}
 	return newdir, nil
 }
+
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	delete(d.Children, req.Name)
 	if err := d.Save(); err != nil {
 		return err
-	}
-	if d.parent != nil {
-		d.parent.Children[d.Name] = d.meta
 	}
 	return nil
 }
@@ -204,6 +210,10 @@ func (d *Dir) Save() error {
 	if d.parent != nil {
 		d.parent.Children[d.Name] = m
 		if err := d.parent.Save(); err != nil {
+			return err
+		}
+	} else {
+		if _, err := d.fs.kvs.Put("fs:root", mhash, -1); err != nil {
 			return err
 		}
 	}
@@ -242,7 +252,6 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 type File struct {
 	fs       *FS
-	buf      *bytes.Buffer
 	ReadOnly bool
 	Data     []byte
 	Meta     *clientutil.Meta
@@ -260,7 +269,6 @@ func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) *File {
 		parent: parent,
 		fs:     fs,
 		Meta:   meta,
-		buf:    &bytes.Buffer{},
 	}
 }
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
@@ -276,14 +284,6 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	}
 
 	resp.Size = len(req.Data)
-	//	if req.Offset != int64(f.buf.Len()) {
-	//		return fmt.Errorf("failed")
-	//	}
-	//	n, err := f.buf.Write(req.Data)
-	//	if err != nil {
-	//		return err
-	//	}
-	//	resp.Size = n
 	f.Wrote = true
 	return nil
 }
@@ -300,11 +300,13 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	if f.Wrote {
 		buf := bytes.NewBuffer(f.Data)
 		m2, _, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
-		f.buf.Reset()
 		if err != nil {
 			return err
 		}
 		f.parent.Children[m2.Name] = m2
+		if err := f.parent.Save(); err != nil {
+			return err
+		}
 		f.Meta = m2
 		log.Printf("FLUSH END %v %+v", f.Meta.Name, f.Meta)
 	}
@@ -367,7 +369,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 			return fuse.EIO
 		}
 		res.Data = buf[:n]
-		log.Printf("Read res=%s", res.Data)
+		log.Printf("Read res len %d", len(res.Data))
 	} else {
 		fuseutil.HandleRead(req, res, f.Data)
 	}
