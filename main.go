@@ -44,8 +44,8 @@ func main() {
 		Usage()
 		os.Exit(2)
 	}
-	mountpoint := flag.Arg(0)
-	name := flag.Arg(1)
+	name := flag.Arg(0)
+	mountpoint := flag.Arg(1)
 
 	lvl, err := log15.LvlFromString(*loglevelPtr)
 	if err != nil {
