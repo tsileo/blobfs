@@ -53,7 +53,12 @@ func main() {
 	}
 	defer c.Close()
 
-	err = fs.Serve(c, &FS{bs: bs, kvs: kvs, uploader: clientutil.NewUploader(bs, kvs)})
+	err = fs.Serve(c, &FS{
+		bs:        bs,
+		kvs:       kvs,
+		uploader:  clientutil.NewUploader(bs, kvs),
+		immutable: false,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,9 +72,14 @@ func main() {
 
 // FS implements the hello world file system.
 type FS struct {
-	kvs      *client.KvStore
-	bs       *client.BlobStore
-	uploader *clientutil.Uploader
+	kvs       *client.KvStore
+	bs        *client.BlobStore
+	uploader  *clientutil.Uploader
+	immutable bool
+}
+
+func (f *FS) Immutable() bool {
+	return f.immutable
 }
 
 var rootKey = "fs:root4"
@@ -162,6 +172,9 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+	if d.fs.Immutable() {
+		return nil, fuse.EPERM
+	}
 	newdir := &Dir{
 		fs:       d.fs,
 		parent:   d,
@@ -179,6 +192,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 }
 
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	if d.fs.Immutable() {
+		return fuse.EPERM
+	}
 	delete(d.Children, req.Name)
 	if err := d.save(); err != nil {
 		return err
@@ -224,6 +240,9 @@ func (d *Dir) save() error {
 }
 
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+	if d.fs.Immutable() {
+		return nil, nil, fuse.EPERM
+	}
 	log.Printf("Dir %+v Create %v", d, req.Name)
 	m := clientutil.NewMeta()
 	m.Type = "file"
@@ -270,6 +289,9 @@ func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) *File {
 	}
 }
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	if f.fs.Immutable() {
+		return fuse.EPERM
+	}
 	log.Printf("Write %v %v %v", f.Meta.Name, req.Offset, len(req.Data))
 	newLen := req.Offset + int64(len(req.Data))
 	if newLen > int64(maxInt) {
@@ -293,6 +315,9 @@ func (*ClosingBuffer) Close() error {
 	return nil
 }
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+	if f.fs.Immutable() {
+		return nil
+	}
 	log.Printf("FLUSH %v %v", f.Meta.Name, f.Meta.Hash)
 	if f.data != nil && len(f.data) > 0 {
 		buf := bytes.NewBuffer(f.data)
@@ -325,6 +350,9 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	if f.fs.Immutable() {
+		return fuse.EPERM
+	}
 	if req.Valid&fuse.SetattrMode != 0 {
 		//if err := os.Chmod(n.path, req.Mode); err != nil {
 		//	return err
