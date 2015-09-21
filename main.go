@@ -1,4 +1,3 @@
-// Hellofs implements a simple "hello world" file system.
 package main
 
 import (
@@ -20,6 +19,8 @@ import (
 	"github.com/tsileo/blobstash/client"
 	"golang.org/x/net/context"
 )
+
+// FIXME when saving with vim, content not available on first read?
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -71,8 +72,10 @@ type FS struct {
 	uploader *clientutil.Uploader
 }
 
+var rootKey = "fs:root3"
+
 func (f *FS) Root() (fs.Node, error) {
-	kv, err := f.kvs.Get("fs:root", -1)
+	kv, err := f.kvs.Get(rootKey, -1)
 	switch err {
 	case nil:
 		m, err := clientutil.NewMetaFromBlobStore(f.bs, kv.Value)
@@ -100,7 +103,6 @@ type Dir struct {
 	meta     *clientutil.Meta
 	parent   *Dir
 	Name     string
-	Hash     string
 	Children map[string]*clientutil.Meta
 }
 
@@ -108,12 +110,10 @@ func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) *Dir {
 	d := &Dir{
 		fs:       fs,
 		meta:     meta,
-		Name:     meta.Name,
-		Hash:     meta.Hash,
 		parent:   parent,
+		Name:     meta.Name,
 		Children: map[string]*clientutil.Meta{},
 	}
-	log.Printf("new dir %+v", d)
 	for _, ref := range d.meta.Refs {
 		m, err := clientutil.NewMetaFromBlobStore(fs.bs, ref.(string))
 		if err != nil {
@@ -162,13 +162,16 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	newdir := &Dir{Name: req.Name, fs: d.fs, Children: map[string]*clientutil.Meta{}, parent: d}
+	newdir := &Dir{
+		fs:       d.fs,
+		parent:   d,
+		Name:     req.Name,
+		Children: map[string]*clientutil.Meta{},
+	}
 	if err := newdir.Save(); err != nil {
-		log.Printf("newdir err: %v", err)
 		return nil, err
 	}
-	d.Children[newdir.meta.Name] = newdir.meta
-	log.Printf("%+v %+v", d, newdir)
+	d.Children[newdir.Name] = newdir.meta
 	if err := d.Save(); err != nil {
 		return nil, err
 	}
@@ -184,7 +187,6 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 }
 
 func (d *Dir) Save() error {
-	log.Printf("Dir.Save %+v", d)
 	m := clientutil.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
@@ -213,19 +215,20 @@ func (d *Dir) Save() error {
 			return err
 		}
 	} else {
-		if _, err := d.fs.kvs.Put("fs:root", mhash, -1); err != nil {
+		// If no parent, this is the root so save the ref
+		if _, err := d.fs.kvs.Put(rootKey, mhash, -1); err != nil {
 			return err
 		}
 	}
-	d.Hash = mhash
-	log.Printf("Dir.Save end %+v", d)
 	return nil
 }
+
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	log.Printf("Dir %+v Create %v", d, req.Name)
 	m := clientutil.NewMeta()
 	m.Type = "file"
 	m.Name = req.Name
+	m.Mode = uint32(req.Mode)
 	m.ModTime = time.Now().Format(time.RFC3339)
 	mhash, mjs := m.Json()
 	m.Hash = mhash
@@ -238,9 +241,6 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 			return nil, nil, err
 		}
 	}
-	d.meta = m
-	d.Hash = mhash
-
 	time.Sleep(100 * time.Millisecond)
 	f := NewFile(d.fs, m, d)
 	d.Children[m.Name] = m
@@ -308,7 +308,7 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 			return err
 		}
 		f.Meta = m2
-		log.Printf("FLUSH END %v %+v", f.Meta.Name, f.Meta)
+		log.Printf("FLUSHED %v", f.Meta.Name)
 	}
 	return nil
 }
@@ -323,6 +323,49 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 			panic(fmt.Errorf("error parsing mtime for %v: %v", f, err))
 		}
 		a.Mtime = t
+	}
+	return nil
+}
+
+func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	if req.Valid&fuse.SetattrMode != 0 {
+		//if err := os.Chmod(n.path, req.Mode); err != nil {
+		//	return err
+		//}
+		log.Printf("Setattr %v chmod", f.Meta.Name)
+	}
+	//if req.Valid&(fuse.SetattrUid|fuse.SetattrGid) != 0 {
+	//	if req.Valid&fuse.SetattrUid&fuse.SetattrGid == 0 {
+	//fi, err := os.Stat(n.path)
+	//if err != nil {
+	//	return err
+	//}
+	//st, ok := fi.Sys().(*syscall.Stat_t)
+	//if !ok {
+	//	return fmt.Errorf("unknown stat.Sys %T", fi.Sys())
+	//}
+	//if req.Valid&fuse.SetattrUid == 0 {
+	//	req.Uid = st.Uid
+	//} else {
+	//	req.Gid = st.Gid
+	//}
+	//	}
+	//	if err := os.Chown(n.path, int(req.Uid), int(req.Gid)); err != nil {
+	//		return err
+	//	}
+	//}
+	if req.Valid&fuse.SetattrSize != 0 {
+		//if err := os.Truncate(n.path, int64(req.Size)); err != nil {
+		//	return err
+		//}
+		log.Printf("Setattr %v size %v", f.Meta.Name, req.Size)
+	}
+
+	if req.Valid&fuse.SetattrAtime != 0 {
+		log.Printf("Setattr %v canot set atime", f.Meta.Name)
+	}
+	if req.Valid&fuse.SetattrMtime != 0 {
+		log.Printf("Setattr %v cannot set mtime", f.Meta.Name)
 	}
 	return nil
 }
@@ -348,10 +391,12 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	f.Wrote = false
 	return nil
 }
+
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	log.Printf("fsync %+v", f)
 	return nil
 }
+
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
 	log.Printf("Read %+v %+v", f, req)
 	if !f.Wrote && f.FakeFile != nil {
