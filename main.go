@@ -35,6 +35,7 @@ var Log = log15.New()
 func main() {
 	hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
 	loglevelPtr := flag.String("loglevel", "info", "logging level (debug|info|warn|crit)")
+	immutablePtr := flag.Bool("immutable", false, "make the filesystem immutable")
 
 	flag.Usage = Usage
 	flag.Parse()
@@ -53,7 +54,7 @@ func main() {
 	Log.SetHandler(log15.LvlFilterHandler(lvl, log15.StreamHandler(os.Stdout, log15.TerminalFormat())))
 
 	fslog := Log.New("name", name)
-	fslog.Info("Mouting fs...", "mountpoint", mountpoint)
+	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
 	bs := client.NewBlobStore(*hostPtr)
 	kvs := client.NewKvStore(*hostPtr)
 	c, err := fuse.Mount(
@@ -74,7 +75,7 @@ func main() {
 		bs:        bs,
 		kvs:       kvs,
 		uploader:  clientutil.NewUploader(bs, kvs),
-		immutable: false,
+		immutable: *immutablePtr,
 	})
 	if err != nil {
 		log.Fatal(err)
