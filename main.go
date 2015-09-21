@@ -13,11 +13,11 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	_ "bazil.org/fuse/fs/fstestutil"
 	"bazil.org/fuse/fuseutil"
 	"github.com/tsileo/blobsnap/clientutil"
 	"github.com/tsileo/blobstash/client"
 	"golang.org/x/net/context"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 // FIXME when saving with vim, content not available on first read?
@@ -26,21 +26,36 @@ const maxInt = int(^uint(0) >> 1)
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "  %s MOUNTPOINT\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s NAME MOUNTPOINT\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
+var Log = log15.New()
+
 func main() {
+	hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
+	loglevelPtr := flag.String("loglevel", "info", "logging level (debug|info|warn|crit)")
+
 	flag.Usage = Usage
 	flag.Parse()
 
-	if flag.NArg() != 1 {
+	if flag.NArg() != 2 {
 		Usage()
 		os.Exit(2)
 	}
 	mountpoint := flag.Arg(0)
-	bs := client.NewBlobStore("")
-	kvs := client.NewKvStore("")
+	name := flag.Arg(1)
+
+	lvl, err := log15.LvlFromString(*loglevelPtr)
+	if err != nil {
+		panic(err)
+	}
+	Log.SetHandler(log15.LvlFilterHandler(lvl, log15.StreamHandler(os.Stdout, log15.TerminalFormat())))
+
+	fslog := Log.New("name", name)
+	fslog.Info("Mouting fs...", "mountpoint", mountpoint)
+	bs := client.NewBlobStore(*hostPtr)
+	kvs := client.NewKvStore(*hostPtr)
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName("blobfs"),
@@ -54,6 +69,8 @@ func main() {
 	defer c.Close()
 
 	err = fs.Serve(c, &FS{
+		log:       fslog,
+		name:      name,
 		bs:        bs,
 		kvs:       kvs,
 		uploader:  clientutil.NewUploader(bs, kvs),
@@ -72,35 +89,42 @@ func main() {
 
 // FS implements the hello world file system.
 type FS struct {
+	log       log15.Logger
 	kvs       *client.KvStore
 	bs        *client.BlobStore
 	uploader  *clientutil.Uploader
 	immutable bool
+	name      string
 }
 
 func (f *FS) Immutable() bool {
 	return f.immutable
 }
 
-var rootKey = "fs:root4"
+func (f *FS) Name() string {
+	return f.name
+}
+
+var rootKeyFmt = "blobfs:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
-	kv, err := f.kvs.Get(rootKey, -1)
+	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
 		m, err := clientutil.NewMetaFromBlobStore(f.bs, kv.Value)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("meta root: %+v", m)
+		f.log.Debug("loaded meta root", "ref", m.Hash)
 		root := NewDir(f, m, nil)
 		return root, nil
 	case client.ErrKeyNotFound:
-		log.Printf("Creating root")
 		root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
 		if err := root.save(); err != nil {
 			return nil, err
 		}
+		f.log.Debug("Creating a new root", "ref", root.meta.Hash)
+		root.log = f.log.New("ref", root.meta.Hash[:10], "name", root.meta.Name, "type", "dir")
 		return root, nil
 	default:
 		return nil, err
@@ -114,6 +138,7 @@ type Dir struct {
 	parent   *Dir
 	Name     string
 	Children map[string]*clientutil.Meta
+	log      log15.Logger
 }
 
 func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) *Dir {
@@ -123,6 +148,7 @@ func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) *Dir {
 		parent:   parent,
 		Name:     meta.Name,
 		Children: map[string]*clientutil.Meta{},
+		log:      fs.log.New("ref", meta.Hash[:10], "name", meta.Name, "type", "dir"),
 	}
 	for _, ref := range d.meta.Refs {
 		m, err := clientutil.NewMetaFromBlobStore(fs.bs, ref.(string))
@@ -141,6 +167,7 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	d.log.Debug("OP Lookup", "name", name)
 	if c, ok := d.Children[name]; ok {
 		if c.IsFile() {
 			return NewFile(d.fs, c, d), nil
@@ -152,6 +179,7 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 }
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	d.log.Debug("OP ReadDirAll")
 	dirs := []fuse.Dirent{}
 	for _, c := range d.Children {
 		if c.IsDir() {
@@ -172,6 +200,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+	d.log.Debug("OP Mkdir", "name", req.Name)
 	if d.fs.Immutable() {
 		return nil, fuse.EPERM
 	}
@@ -188,10 +217,12 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	if err := d.save(); err != nil {
 		return nil, err
 	}
+	newdir.log = d.fs.log.New("ref", newdir.meta.Hash[:10], "name", newdir.meta.Name, "type", "dir")
 	return newdir, nil
 }
 
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	d.log.Debug("OP Remove", "name", req.Name)
 	if d.fs.Immutable() {
 		return fuse.EPERM
 	}
@@ -232,7 +263,7 @@ func (d *Dir) save() error {
 		}
 	} else {
 		// If no parent, this is the root so save the ref
-		if _, err := d.fs.kvs.Put(rootKey, mhash, -1); err != nil {
+		if _, err := d.fs.kvs.Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), mhash, -1); err != nil {
 			return err
 		}
 	}
@@ -240,10 +271,10 @@ func (d *Dir) save() error {
 }
 
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+	d.log.Debug("OP Create", "name", req.Name)
 	if d.fs.Immutable() {
 		return nil, nil, fuse.EPERM
 	}
-	log.Printf("Dir %+v Create %v", d, req.Name)
 	m := clientutil.NewMeta()
 	m.Type = "file"
 	m.Name = req.Name
@@ -274,6 +305,7 @@ type File struct {
 	data     []byte
 	Meta     *clientutil.Meta
 	FakeFile *clientutil.FakeFile
+	log      log15.Logger
 	parent   *Dir
 }
 
@@ -286,13 +318,14 @@ func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) *File {
 		parent: parent,
 		fs:     fs,
 		Meta:   meta,
+		log:    fs.log.New("ref", meta.Hash[:10], "name", meta.Name, "type", "file"),
 	}
 }
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
 	if f.fs.Immutable() {
 		return fuse.EPERM
 	}
-	log.Printf("Write %v %v %v", f.Meta.Name, req.Offset, len(req.Data))
 	newLen := req.Offset + int64(len(req.Data))
 	if newLen > int64(maxInt) {
 		return fuse.Errno(syscall.EFBIG)
@@ -315,10 +348,10 @@ func (*ClosingBuffer) Close() error {
 	return nil
 }
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
+	f.log.Debug("OP Flush")
 	if f.fs.Immutable() {
 		return nil
 	}
-	log.Printf("FLUSH %v %v", f.Meta.Name, f.Meta.Hash)
 	if f.data != nil && len(f.data) > 0 {
 		buf := bytes.NewBuffer(f.data)
 		m2, _, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
@@ -330,12 +363,14 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 			return err
 		}
 		f.Meta = m2
-		log.Printf("FLUSHED %v", f.Meta.Name)
+		f.log = f.log.New("ref", m2.Hash[:10])
+		f.log.Debug("Flushed")
 	}
 	return nil
 }
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
+	f.log.Debug("OP Attr")
 	a.Inode = 2
 	a.Mode = os.FileMode(f.Meta.Mode)
 	a.Size = uint64(f.Meta.Size)
@@ -350,15 +385,16 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	f.log.Debug("OP Setattr")
 	if f.fs.Immutable() {
 		return fuse.EPERM
 	}
-	if req.Valid&fuse.SetattrMode != 0 {
-		//if err := os.Chmod(n.path, req.Mode); err != nil {
-		//	return err
-		//}
-		log.Printf("Setattr %v chmod", f.Meta.Name)
-	}
+	//if req.Valid&fuse.SetattrMode != 0 {
+	//if err := os.Chmod(n.path, req.Mode); err != nil {
+	//	return err
+	//}
+	//	log.Printf("Setattr %v chmod", f.Meta.Name)
+	//}
 	//if req.Valid&(fuse.SetattrUid|fuse.SetattrGid) != 0 {
 	//	if req.Valid&fuse.SetattrUid&fuse.SetattrGid == 0 {
 	//fi, err := os.Stat(n.path)
@@ -379,33 +415,33 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	//		return err
 	//	}
 	//}
-	if req.Valid&fuse.SetattrSize != 0 {
-		//if err := os.Truncate(n.path, int64(req.Size)); err != nil {
-		//	return err
-		//}
-		log.Printf("Setattr %v size %v", f.Meta.Name, req.Size)
-	}
+	//if req.Valid&fuse.SetattrSize != 0 {
+	//if err := os.Truncate(n.path, int64(req.Size)); err != nil {
+	//	return err
+	//}
+	//log.Printf("Setattr %v size %v", f.Meta.Name, req.Size)
+	//}
 
-	if req.Valid&fuse.SetattrAtime != 0 {
-		log.Printf("Setattr %v canot set atime", f.Meta.Name)
-	}
-	if req.Valid&fuse.SetattrMtime != 0 {
-		log.Printf("Setattr %v cannot set mtime", f.Meta.Name)
-	}
+	//if req.Valid&fuse.SetattrAtime != 0 {
+	//log.Printf("Setattr %v canot set atime", f.Meta.Name)
+	//}
+	//if req.Valid&fuse.SetattrMtime != 0 {
+	//	log.Printf("Setattr %v cannot set mtime", f.Meta.Name)
+	//}
 	return nil
 }
 
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
-	log.Printf("OPEN %+v %+v", f.Meta.Name, f.Meta)
+	f.log.Debug("OP Open")
 	if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
-		log.Printf("Open with fakefile")
+		f.log.Debug("Open with fakefile")
 		f.FakeFile = clientutil.NewFakeFile(f.fs.bs, f.Meta)
 	}
 	return f, nil
 }
 
 func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
-	log.Printf("Release %+v", f.Meta.Name)
+	f.log.Debug("OP Release")
 	if f.FakeFile != nil {
 		f.FakeFile.Close()
 		f.FakeFile = nil
@@ -415,14 +451,13 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 }
 
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	log.Printf("fsync %v", f.Meta.Name)
+	f.log.Debug("OP Fsync")
 	return nil
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
-	log.Printf("Read %+v %+v", f, req)
+	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
 	if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
-		log.Printf("Read using FakeFile at %v %v", req.Offset, req.Size)
 		if req.Offset >= int64(f.Meta.Size) {
 			return nil
 		}
@@ -432,11 +467,9 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 			err = nil
 		}
 		if err != nil {
-			log.Printf("Error reading FakeFile %+v on %v at %d: %v", f, f.Meta.Hash, req.Offset, err)
 			return fuse.EIO
 		}
 		res.Data = buf[:n]
-		log.Printf("Read res len %d", len(res.Data))
 	} else {
 		fuseutil.HandleRead(req, res, f.data)
 	}
