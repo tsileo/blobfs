@@ -72,7 +72,7 @@ type FS struct {
 	uploader *clientutil.Uploader
 }
 
-var rootKey = "fs:root3"
+var rootKey = "fs:root4"
 
 func (f *FS) Root() (fs.Node, error) {
 	kv, err := f.kvs.Get(rootKey, -1)
@@ -88,7 +88,7 @@ func (f *FS) Root() (fs.Node, error) {
 	case client.ErrKeyNotFound:
 		log.Printf("Creating root")
 		root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
-		if err := root.Save(); err != nil {
+		if err := root.save(); err != nil {
 			return nil, err
 		}
 		return root, nil
@@ -168,11 +168,11 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		Name:     req.Name,
 		Children: map[string]*clientutil.Meta{},
 	}
-	if err := newdir.Save(); err != nil {
+	if err := newdir.save(); err != nil {
 		return nil, err
 	}
 	d.Children[newdir.Name] = newdir.meta
-	if err := d.Save(); err != nil {
+	if err := d.save(); err != nil {
 		return nil, err
 	}
 	return newdir, nil
@@ -180,13 +180,13 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	delete(d.Children, req.Name)
-	if err := d.Save(); err != nil {
+	if err := d.save(); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (d *Dir) Save() error {
+func (d *Dir) save() error {
 	m := clientutil.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
@@ -211,7 +211,7 @@ func (d *Dir) Save() error {
 	}
 	if d.parent != nil {
 		d.parent.Children[d.Name] = m
-		if err := d.parent.Save(); err != nil {
+		if err := d.parent.save(); err != nil {
 			return err
 		}
 	} else {
@@ -241,10 +241,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 			return nil, nil, err
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	f := NewFile(d.fs, m, d)
 	d.Children[m.Name] = m
-	if err := d.Save(); err != nil {
+	if err := d.save(); err != nil {
 		return nil, nil, err
 	}
 	return f, f, nil
@@ -252,12 +252,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 type File struct {
 	fs       *FS
-	ReadOnly bool
-	Data     []byte
+	data     []byte
 	Meta     *clientutil.Meta
 	FakeFile *clientutil.FakeFile
 	parent   *Dir
-	Wrote    bool
 }
 
 func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) *File {
@@ -278,13 +276,12 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		return fuse.Errno(syscall.EFBIG)
 	}
 
-	n := copy(f.Data[req.Offset:], req.Data)
+	n := copy(f.data[req.Offset:], req.Data)
 	if n < len(req.Data) {
-		f.Data = append(f.Data, req.Data[n:]...)
+		f.data = append(f.data, req.Data[n:]...)
 	}
 
 	resp.Size = len(req.Data)
-	f.Wrote = true
 	return nil
 }
 
@@ -297,14 +294,14 @@ func (*ClosingBuffer) Close() error {
 }
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	log.Printf("FLUSH %v %v", f.Meta.Name, f.Meta.Hash)
-	if f.Wrote {
-		buf := bytes.NewBuffer(f.Data)
+	if f.data != nil && len(f.data) > 0 {
+		buf := bytes.NewBuffer(f.data)
 		m2, _, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
 		if err != nil {
 			return err
 		}
 		f.parent.Children[m2.Name] = m2
-		if err := f.parent.Save(); err != nil {
+		if err := f.parent.save(); err != nil {
 			return err
 		}
 		f.Meta = m2
@@ -371,10 +368,9 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 }
 
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
-	log.Printf("OPEN %+v %+v [ro:%v]", f.Meta.Name, f.Meta, f.ReadOnly)
+	log.Printf("OPEN %+v %+v", f.Meta.Name, f.Meta)
 	if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
 		log.Printf("Open with fakefile")
-		f.ReadOnly = true
 		f.FakeFile = clientutil.NewFakeFile(f.fs.bs, f.Meta)
 	}
 	return f, nil
@@ -386,20 +382,18 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 		f.FakeFile.Close()
 		f.FakeFile = nil
 	}
-	f.ReadOnly = false
-	f.Data = nil
-	f.Wrote = false
+	f.data = nil
 	return nil
 }
 
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	log.Printf("fsync %+v", f)
+	log.Printf("fsync %v", f.Meta.Name)
 	return nil
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
 	log.Printf("Read %+v %+v", f, req)
-	if !f.Wrote && f.FakeFile != nil {
+	if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
 		log.Printf("Read using FakeFile at %v %v", req.Offset, req.Size)
 		if req.Offset >= int64(f.Meta.Size) {
 			return nil
@@ -416,7 +410,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 		res.Data = buf[:n]
 		log.Printf("Read res len %d", len(res.Data))
 	} else {
-		fuseutil.HandleRead(req, res, f.Data)
+		fuseutil.HandleRead(req, res, f.data)
 	}
 	return nil
 }
