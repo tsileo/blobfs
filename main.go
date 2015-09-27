@@ -133,6 +133,27 @@ func (f *FS) Root() (fs.Node, error) {
 	}
 }
 
+type debugFile struct {
+	data []byte
+}
+
+func newDebugFile(data string) *debugFile {
+	return &debugFile{
+		data: []byte(data),
+	}
+}
+
+func (f *debugFile) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Inode = 2
+	a.Mode = 0444
+	a.Size = uint64(len(f.data))
+	return nil
+}
+
+func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
+	return f.data, nil
+}
+
 // Dir implements both Node and Handle for the root directory.
 type Dir struct {
 	fs       *FS
@@ -175,10 +196,13 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if strings.HasSuffix(name, ".blobfs") {
 		debug = true
 		d.log.Debug("_debug query")
-		name = strings.Replace(name, ".blobsfs", "", 1)
+		name = strings.Replace(name, ".blobfs", "", 1)
 	}
 	// TODO if name == "" => return fakefile
-	d.log.Debug("OP Lookup", "name", name)
+	d.log.Debug("OP Lookup", "name", name, "debug", debug)
+	if debug {
+		return newDebugFile(d.meta.Hash), nil
+	}
 	if c, ok := d.Children[name]; ok {
 		// TODO returns fakefile if debug
 		if c.IsFile() {
