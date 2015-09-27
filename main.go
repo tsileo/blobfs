@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -167,9 +168,19 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
+// TODO implements dummy string file for debug
+
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	var debug bool
+	if strings.HasSuffix(name, ".blobfs") {
+		debug = true
+		d.log.Debug("_debug query")
+		name = strings.Replace(name, ".blobsfs", "", 1)
+	}
+	// TODO if name == "" => return fakefile
 	d.log.Debug("OP Lookup", "name", name)
 	if c, ok := d.Children[name]; ok {
+		// TODO returns fakefile if debug
 		if c.IsFile() {
 			return NewFile(d.fs, c, d), nil
 		} else {
