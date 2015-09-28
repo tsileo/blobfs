@@ -1,4 +1,4 @@
-#cat omg/itv/.blobfs | awk '{print "http://localhost:8050/api/v1/blobstore/blob/"$1}' | xargs curl | jq .
+#!/bin/bash
 host="http://localhost:8050/api/v1/blobstore/blob/"
 if [ -d "$1" ]
 then
