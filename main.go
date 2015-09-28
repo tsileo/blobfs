@@ -189,22 +189,25 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-// TODO implements dummy string file for debug
-
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	var debug bool
-	if strings.HasSuffix(name, ".blobfs") {
-		debug = true
-		d.log.Debug("_debug query")
-		name = strings.Replace(name, ".blobfs", "", 1)
-	}
-	// TODO if name == "" => return fakefile
-	d.log.Debug("OP Lookup", "name", name, "debug", debug)
-	if debug {
+	d.log.Debug("OP Lookup", "name", name)
+	// check if debug data is requested.
+	switch {
+	case name == ".blobfs":
+		// .blobfs is requested
+		// dump the current dir debug data
 		return newDebugFile(d.meta.Hash), nil
+	case strings.HasSuffix(name, ".blobfs"):
+		// returns a file meta data
+		name = strings.Replace(name, ".blobfs", "", 1)
+		if c, ok := d.Children[name]; ok {
+			if c.IsFile() {
+				return newDebugFile(c.Hash), nil
+			}
+		}
 	}
+	// normal lookup operation
 	if c, ok := d.Children[name]; ok {
-		// TODO returns fakefile if debug
 		if c.IsFile() {
 			return NewFile(d.fs, c, d), nil
 		} else {
