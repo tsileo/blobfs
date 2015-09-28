@@ -3,8 +3,8 @@ host="http://localhost:8050/api/v1/blobstore/blob/"
 if [ -d "$1" ]
 then
   hash=`cat $1/.blobfs`
-  curl $host$hash | jq .
 else
   hash=`cat $1.blobfs`
-  curl $host$hash | jq .
 fi
+echo "Hash: $hash"
+curl $host$hash | jq .

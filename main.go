@@ -4,9 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +32,7 @@ var Usage = func() {
 }
 
 var Log = log15.New()
+var stats *Stats
 
 func main() {
 	hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
@@ -53,8 +54,19 @@ func main() {
 		panic(err)
 	}
 	Log.SetHandler(log15.LvlFilterHandler(lvl, log15.StreamHandler(os.Stdout, log15.TerminalFormat())))
-
 	fslog := Log.New("name", name)
+
+	stats = &Stats{}
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		for _ = range t.C {
+			if stats.updated {
+				fslog.Info(stats.String())
+				stats.Reset()
+			}
+		}
+	}()
+
 	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
 	bs := client.NewBlobStore(*hostPtr)
 	kvs := client.NewKvStore(*hostPtr)
@@ -66,7 +78,8 @@ func main() {
 		fuse.VolumeName("BlobFS"),
 	)
 	if err != nil {
-		log.Fatal(err)
+		fslog.Crit("failed to mount", "err", err)
+		os.Exit(1)
 	}
 	defer c.Close()
 
@@ -79,14 +92,36 @@ func main() {
 		immutable: *immutablePtr,
 	})
 	if err != nil {
-		log.Fatal(err)
+		fslog.Crit("failed to serve", "err", err)
+		os.Exit(1)
 	}
 
 	// check if the mount process has an error to report
 	<-c.Ready
 	if err := c.MountError; err != nil {
-		log.Fatal(err)
+		fslog.Crit("mount error", "err", err)
+		os.Exit(1)
 	}
+}
+
+type Stats struct {
+	FilesCreated int
+	DirsCreated  int
+	FilesUpdated int
+	DirsUpdated  int
+	updated      bool
+	sync.Mutex
+}
+
+func (s *Stats) Reset() {
+	s.FilesCreated = 0
+	s.DirsCreated = 0
+	s.FilesUpdated = 0
+	s.DirsUpdated = 0
+	s.updated = false
+}
+func (s *Stats) String() string {
+	return fmt.Sprintf("%d files created, %d dirs created", s.FilesCreated, s.DirsCreated)
 }
 
 // FS implements the hello world file system.
@@ -121,11 +156,12 @@ func (f *FS) Root() (fs.Node, error) {
 		return NewDir(f, m, nil)
 	case client.ErrKeyNotFound:
 		root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
+		root.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 		if err := root.save(); err != nil {
 			return nil, err
 		}
 		f.log.Debug("Creating a new root", "ref", root.meta.Hash)
-		root.log = f.log.New("ref", root.meta.Hash[:10], "name", root.meta.Name, "type", "dir")
+		root.log = root.log.New("ref", root.meta.Hash[:10])
 		return root, nil
 	default:
 		return nil, err
@@ -249,6 +285,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		Name:     req.Name,
 		Children: map[string]*clientutil.Meta{},
 	}
+	newdir.log = d.fs.log.New("ref", "unknown", "name", req.Name, "type", "dir")
 	if err := newdir.save(); err != nil {
 		return nil, err
 	}
@@ -256,7 +293,13 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	if err := d.save(); err != nil {
 		return nil, err
 	}
-	newdir.log = d.fs.log.New("ref", newdir.meta.Hash[:10], "name", newdir.meta.Name, "type", "dir")
+	newdir.log = newdir.log.New("ref", newdir.meta.Hash[:10])
+
+	stats.Lock()
+	stats.updated = true
+	stats.DirsCreated++
+	stats.Unlock()
+
 	return newdir, nil
 }
 
@@ -273,6 +316,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 }
 
 func (d *Dir) save() error {
+	d.log.Debug("save")
 	m := clientutil.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
@@ -286,12 +330,12 @@ func (d *Dir) save() error {
 	d.meta = m
 	mexists, err := d.fs.bs.Stat(mhash)
 	if err != nil {
-		log.Printf("stats failed %v", err)
+		d.log.Error("stat failed", "err", err)
 		return err
 	}
 	if !mexists {
 		if err := d.fs.bs.Put(mhash, mjs); err != nil {
-			log.Printf("put failed %v", err)
+			d.log.Error("put failed", "err", err)
 			return err
 		}
 	}
@@ -349,6 +393,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if err := d.save(); err != nil {
 		return nil, nil, err
 	}
+	stats.Lock()
+	stats.updated = true
+	stats.FilesCreated++
+	stats.Unlock()
 	return f, f, nil
 }
 
@@ -373,6 +421,7 @@ func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) (*File, error) {
 		log:    fs.log.New("ref", meta.Hash[:10], "name", meta.Name, "type", "file"),
 	}, nil
 }
+
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
 	if f.fs.Immutable() {
@@ -399,6 +448,7 @@ type ClosingBuffer struct {
 func (*ClosingBuffer) Close() error {
 	return nil
 }
+
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.log.Debug("OP Flush")
 	if f.fs.Immutable() {
@@ -406,7 +456,8 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	}
 	if f.data != nil && len(f.data) > 0 {
 		buf := bytes.NewBuffer(f.data)
-		m2, _, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
+		m2, wr, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
+		f.log.Debug("WriteResult", "wr", wr)
 		if err != nil {
 			return err
 		}
