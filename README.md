@@ -16,7 +16,22 @@ Usage of blobfs:
 
 You can dump the meta hash by opening the special `.blobfs` file in dir (like `/mnt/my/dir/.blobfs`), or `*.blobfs` (like `/mnt/my/file.blobfs`).
 
+### blobfsdebug
+
 ```
-$ cat mnt/.blobfs | awk '{print "http://localhost:8050/api/v1/blobstore/blob/"$1}' | xargs curl | jq .
-$ cat mnt/file.blobfs | awk '{print "http://localhost:8050/api/v1/blobstore/blob/"$1}' | xargs curl | jq .
+$ ./debug/blobfsdebug mnt/hello.txt 
+{
+  "name": "hello.txt",
+  "type": "file",
+  "size": 1189,
+  "mode": 438,
+  "mtime": "2015-09-22T10:53:22+02:00",
+  "refs": [
+    [
+      1189,
+      "8ab2ebc58055ca8439070c9d7b5527dcf5931ee46d0f91fec9cf99ab7cff9758"
+    ]
+  ],
+  "version": "1"
+}
 ```
