@@ -118,8 +118,7 @@ func (f *FS) Root() (fs.Node, error) {
 			return nil, err
 		}
 		f.log.Debug("loaded meta root", "ref", m.Hash)
-		root := NewDir(f, m, nil)
-		return root, nil
+		return NewDir(f, m, nil)
 	case client.ErrKeyNotFound:
 		root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
 		if err := root.save(); err != nil {
@@ -165,7 +164,7 @@ type Dir struct {
 	log      log15.Logger
 }
 
-func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) *Dir {
+func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) (*Dir, error) {
 	d := &Dir{
 		fs:       fs,
 		meta:     meta,
@@ -177,11 +176,11 @@ func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) *Dir {
 	for _, ref := range d.meta.Refs {
 		m, err := clientutil.NewMetaFromBlobStore(fs.bs, ref.(string))
 		if err != nil {
-			panic(err)
+			return d, err
 		}
 		d.Children[m.Name] = m
 	}
-	return d
+	return d, nil
 }
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
@@ -210,9 +209,9 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	// normal lookup operation
 	if c, ok := d.Children[name]; ok {
 		if c.IsFile() {
-			return NewFile(d.fs, c, d), nil
+			return NewFile(d.fs, c, d)
 		} else {
-			return NewDir(d.fs, c, d), nil
+			return NewDir(d.fs, c, d)
 		}
 	}
 	return nil, fuse.ENOENT
@@ -331,8 +330,21 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 			return nil, nil, err
 		}
 	}
-	time.Sleep(500 * time.Millisecond)
-	f := NewFile(d.fs, m, d)
+	// FIXME blobstash async mode
+	// try if the meta hash is not already indexed
+	var f *File
+	for i := 0; i < 5; i++ {
+		f, err = NewFile(d.fs, m, d)
+		if err != nil {
+			d.log.Debug("failed to fetch file", "attempt", i+1, "err", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	if f == nil {
+		return nil, nil, err
+	}
 	d.Children[m.Name] = m
 	if err := d.save(); err != nil {
 		return nil, nil, err
@@ -349,17 +361,17 @@ type File struct {
 	parent   *Dir
 }
 
-func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) *File {
+func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) (*File, error) {
 	meta, err := clientutil.NewMetaFromBlobStore(fs.bs, meta.Hash)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	return &File{
 		parent: parent,
 		fs:     fs,
 		Meta:   meta,
 		log:    fs.log.New("ref", meta.Hash[:10], "name", meta.Name, "type", "file"),
-	}
+	}, nil
 }
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
