@@ -133,6 +133,7 @@ func (f *FS) Root() (fs.Node, error) {
 	}
 }
 
+// debugFile is a dummy file that hold a string
 type debugFile struct {
 	data []byte
 }
@@ -341,7 +342,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 type File struct {
 	fs       *FS
-	data     []byte
+	data     []byte // FIXME if data grows too much, use a temp file
 	Meta     *clientutil.Meta
 	FakeFile *clientutil.FakeFile
 	log      log15.Logger

@@ -1,0 +1,10 @@
+#cat omg/itv/.blobfs | awk '{print "http://localhost:8050/api/v1/blobstore/blob/"$1}' | xargs curl | jq .
+host="http://localhost:8050/api/v1/blobstore/blob/"
+if [ -d "$1" ]
+then
+  hash=`cat $1/.blobfs`
+  curl $host$hash | jq .
+else
+  hash=`cat $1.blobfs`
+  curl $host$hash | jq .
+fi
