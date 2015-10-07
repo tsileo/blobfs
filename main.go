@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
+	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobsnap/clientutil"
 	"github.com/tsileo/blobstash/client"
 	"golang.org/x/net/context"
@@ -38,6 +40,7 @@ func main() {
 	hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
 	loglevelPtr := flag.String("loglevel", "info", "logging level (debug|info|warn|crit)")
 	immutablePtr := flag.Bool("immutable", false, "make the filesystem immutable")
+	hostnamePtr := flag.String("hostname", "", "default to system hostname")
 
 	flag.Usage = Usage
 	flag.Parse()
@@ -48,6 +51,15 @@ func main() {
 	}
 	name := flag.Arg(0)
 	mountpoint := flag.Arg(1)
+
+	var err error
+	root.Hostname = *hostnamePtr
+	if root.Hostname == "" {
+		root.Hostname, err = os.Hostname()
+		if err != nil {
+			fmt.Printf("failed to retrieve hostname, set one manually: %v", err)
+		}
+	}
 
 	lvl, err := log15.LvlFromString(*loglevelPtr)
 	if err != nil {
@@ -70,6 +82,9 @@ func main() {
 	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
 	bs := client.NewBlobStore(*hostPtr)
 	kvs := client.NewKvStore(*hostPtr)
+
+	//ls.Ls(kvs)
+	//os.Exit(2)
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName("blobfs"),
@@ -124,7 +139,6 @@ func (s *Stats) String() string {
 	return fmt.Sprintf("%d files created, %d dirs created", s.FilesCreated, s.DirsCreated)
 }
 
-// FS implements the hello world file system.
 type FS struct {
 	log       log15.Logger
 	kvs       *client.KvStore
@@ -142,13 +156,17 @@ func (f *FS) Name() string {
 	return f.name
 }
 
-var rootKeyFmt = "blobfs:root:%v"
+var rootKeyFmt = "blobfs2:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
 	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
-		m, err := clientutil.NewMetaFromBlobStore(f.bs, kv.Value)
+		root, err := root.NewFromJSON([]byte(kv.Value))
+		if err != nil {
+			return nil, err
+		}
+		m, err := clientutil.NewMetaFromBlobStore(f.bs, root.Ref)
 		if err != nil {
 			return nil, err
 		}
@@ -346,7 +364,12 @@ func (d *Dir) save() error {
 		}
 	} else {
 		// If no parent, this is the root so save the ref
-		if _, err := d.fs.kvs.Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), mhash, -1); err != nil {
+		root := root.New(mhash)
+		js, err := json.Marshal(root)
+		if err != nil {
+			return err
+		}
+		if _, err := d.fs.kvs.Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
 			return err
 		}
 	}
