@@ -35,3 +35,10 @@ $ ./debug/blobfsdebug mnt/hello.txt
   "version": "1"
 }
 ```
+
+## TODOs
+
+- [ ] Support BlobStash namespace
+- [ ] Watch the root key for update
+- [ ] A `put` subcommand for upload directory
+- [ ] File locking?
