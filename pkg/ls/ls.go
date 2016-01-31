@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/tsileo/blobfs/pkg/root"
-	"github.com/tsileo/blobstash/client"
+	"github.com/tsileo/blobstash/client/kvstore"
 )
 
-func Ls(kvs *client.KvStore) {
-	res, err := kvs.Keys("blobfs2:root:", "blobfs2:root:\xff", 0)
+func Ls(kvs *kvstore.KvStore) {
+	res, err := kvs.Keys("blobfs:root:", "blobfs:root:\xff", 0)
 	if err != nil {
 		fmt.Printf("failed to list fs: %v", err)
 		os.Exit(1)

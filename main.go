@@ -17,8 +17,11 @@ import (
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
 	"github.com/tsileo/blobfs/pkg/root"
-	"github.com/tsileo/blobsnap/clientutil"
-	"github.com/tsileo/blobstash/client"
+	"github.com/tsileo/blobstash/client/blobstore"
+	"github.com/tsileo/blobstash/client/kvstore"
+	"github.com/tsileo/blobstash/ext/filetree/filetreeutil/meta"
+	"github.com/tsileo/blobstash/ext/filetree/reader/filereader"
+	"github.com/tsileo/blobstash/ext/filetree/writer"
 	"golang.org/x/net/context"
 	"gopkg.in/inconshreveable/log15.v2"
 )
@@ -80,8 +83,12 @@ func main() {
 	}()
 
 	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
-	bs := client.NewBlobStore(*hostPtr)
-	kvs := client.NewKvStore(*hostPtr)
+	bsOpts := blobstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
+	bsOpts.SnappyCompression = false
+	bs := blobstore.New(bsOpts)
+	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
+	kvsOpts.SnappyCompression = false
+	kvs := kvstore.New(kvsOpts)
 
 	//ls.Ls(kvs)
 	//os.Exit(2)
@@ -103,7 +110,7 @@ func main() {
 		name:      name,
 		bs:        bs,
 		kvs:       kvs,
-		uploader:  clientutil.NewUploader(bs, kvs),
+		uploader:  writer.NewUploader(bs),
 		immutable: *immutablePtr,
 	})
 	if err != nil {
@@ -141,9 +148,9 @@ func (s *Stats) String() string {
 
 type FS struct {
 	log       log15.Logger
-	kvs       *client.KvStore
-	bs        *client.BlobStore
-	uploader  *clientutil.Uploader
+	kvs       *kvstore.KvStore
+	bs        *blobstore.BlobStore
+	uploader  *writer.Uploader
 	immutable bool
 	name      string
 }
@@ -156,7 +163,7 @@ func (f *FS) Name() string {
 	return f.name
 }
 
-var rootKeyFmt = "blobfs2:root:%v"
+var rootKeyFmt = "blobfs:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
 	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
@@ -166,14 +173,18 @@ func (f *FS) Root() (fs.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		m, err := clientutil.NewMetaFromBlobStore(f.bs, root.Ref)
+		blob, err := f.bs.Get(root.Ref)
+		if err != nil {
+			return nil, err
+		}
+		m, err := meta.NewMetaFromBlob(root.Ref, blob)
 		if err != nil {
 			return nil, err
 		}
 		f.log.Debug("loaded meta root", "ref", m.Hash)
 		return NewDir(f, m, nil)
-	case client.ErrKeyNotFound:
-		root := &Dir{fs: f, Name: "_root", Children: map[string]*clientutil.Meta{}}
+	case kvstore.ErrKeyNotFound:
+		root := &Dir{fs: f, Name: "_root", Children: map[string]*meta.Meta{}}
 		root.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 		if err := root.save(); err != nil {
 			return nil, err
@@ -211,24 +222,28 @@ func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
 // Dir implements both Node and Handle for the root directory.
 type Dir struct {
 	fs       *FS
-	meta     *clientutil.Meta
+	meta     *meta.Meta
 	parent   *Dir
 	Name     string
-	Children map[string]*clientutil.Meta
+	Children map[string]*meta.Meta
 	log      log15.Logger
 }
 
-func NewDir(fs *FS, meta *clientutil.Meta, parent *Dir) (*Dir, error) {
+func NewDir(fs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 	d := &Dir{
 		fs:       fs,
-		meta:     meta,
+		meta:     m,
 		parent:   parent,
-		Name:     meta.Name,
-		Children: map[string]*clientutil.Meta{},
-		log:      fs.log.New("ref", meta.Hash[:10], "name", meta.Name, "type", "dir"),
+		Name:     m.Name,
+		Children: map[string]*meta.Meta{},
+		log:      fs.log.New("ref", m.Hash[:10], "name", m.Name, "type", "dir"),
 	}
 	for _, ref := range d.meta.Refs {
-		m, err := clientutil.NewMetaFromBlobStore(fs.bs, ref.(string))
+		blob, err := fs.bs.Get(ref.(string))
+		if err != nil {
+			return nil, err
+		}
+		m, err := meta.NewMetaFromBlob(ref.(string), blob)
 		if err != nil {
 			return d, err
 		}
@@ -301,7 +316,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		fs:       d.fs,
 		parent:   d,
 		Name:     req.Name,
-		Children: map[string]*clientutil.Meta{},
+		Children: map[string]*meta.Meta{},
 	}
 	newdir.log = d.fs.log.New("ref", "unknown", "name", req.Name, "type", "dir")
 	if err := newdir.save(); err != nil {
@@ -335,7 +350,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
 func (d *Dir) save() error {
 	d.log.Debug("save")
-	m := clientutil.NewMeta()
+	m := meta.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
 	m.Mode = uint32(os.ModeDir | 0555)
@@ -381,7 +396,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if d.fs.Immutable() {
 		return nil, nil, fuse.EPERM
 	}
-	m := clientutil.NewMeta()
+	m := meta.NewMeta()
 	m.Type = "file"
 	m.Name = req.Name
 	m.Mode = uint32(req.Mode)
@@ -426,22 +441,26 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 type File struct {
 	fs       *FS
 	data     []byte // FIXME if data grows too much, use a temp file
-	Meta     *clientutil.Meta
-	FakeFile *clientutil.FakeFile
+	Meta     *meta.Meta
+	FakeFile *filereader.File
 	log      log15.Logger
 	parent   *Dir
 }
 
-func NewFile(fs *FS, meta *clientutil.Meta, parent *Dir) (*File, error) {
-	meta, err := clientutil.NewMetaFromBlobStore(fs.bs, meta.Hash)
+func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
+	blob, err := fs.bs.Get(m.Hash)
+	if err != nil {
+		return nil, err
+	}
+	m2, err := meta.NewMetaFromBlob(m.Hash, blob)
 	if err != nil {
 		return nil, err
 	}
 	return &File{
 		parent: parent,
 		fs:     fs,
-		Meta:   meta,
-		log:    fs.log.New("ref", meta.Hash[:10], "name", meta.Name, "type", "file"),
+		Meta:   m2,
+		log:    fs.log.New("ref", m2.Hash[:10], "name", m2.Name, "type", "file"),
 	}, nil
 }
 
@@ -479,8 +498,8 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	}
 	if f.data != nil && len(f.data) > 0 {
 		buf := bytes.NewBuffer(f.data)
-		m2, wr, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
-		f.log.Debug("WriteResult", "wr", wr)
+		m2, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
+		// f.log.Debug("WriteResult", "wr", wr)
 		if err != nil {
 			return err
 		}
@@ -561,7 +580,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 	f.log.Debug("OP Open")
 	if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
 		f.log.Debug("Open with fakefile")
-		f.FakeFile = clientutil.NewFakeFile(f.fs.bs, f.Meta)
+		f.FakeFile = filereader.NewFile(f.fs.bs, f.Meta)
 	}
 	return f, nil
 }
