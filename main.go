@@ -187,7 +187,11 @@ func (f *FS) Root() (fs.Node, error) {
 		f.log.Debug("loaded meta root", "ref", m.Hash)
 		return NewDir(f, m, nil)
 	case kvstore.ErrKeyNotFound:
-		root := &Dir{fs: f, Name: "_root", Children: map[string]*meta.Meta{}}
+		root := &Dir{
+			fs:       f,
+			Name:     "_root",
+			Children: map[string]*meta.Meta{},
+		}
 		root.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 		if err := root.save(); err != nil {
 			return nil, err
@@ -271,13 +275,20 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		if err != nil {
 			return err
 		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
 		// Delete the source
 		delete(d.Children, req.OldName)
 		if err := d.save(); err != nil {
 			return err
 		}
-		newDir.(*Dir).Children[req.NewName] = m2
-		if err := newDir.(*Dir).save(); err != nil {
+		ndir := newDir.(*Dir)
+		if d != ndir {
+			ndir.mu.Lock()
+			defer ndir.mu.Unlock()
+		}
+		ndir.Children[req.NewName] = m2
+		if err := ndir.save(); err != nil {
 			return err
 		}
 		return nil
@@ -337,8 +348,6 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.log.Debug("OP Mkdir", "name", req.Name)
 	defer d.log.Debug("OP Mkdir END", "name", req.Name)
 	if d.fs.Immutable() {
@@ -354,6 +363,8 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	if err := newdir.save(); err != nil {
 		return nil, err
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.Children[newdir.Name] = newdir.meta
 	if err := d.save(); err != nil {
 		return nil, err
@@ -378,13 +389,14 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	}
 	delete(d.Children, req.Name)
 	if err := d.save(); err != nil {
+		d.log.Error("Failed to saved", "err", err)
 		return err
 	}
 	return nil
 }
 
 func (d *Dir) save() error {
-	d.log.Debug("save")
+	d.log.Debug("saving")
 	m := meta.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
@@ -408,6 +420,8 @@ func (d *Dir) save() error {
 		}
 	}
 	if d.parent != nil {
+		d.parent.mu.Lock()
+		defer d.parent.mu.Unlock()
 		d.parent.Children[d.Name] = m
 		if err := d.parent.save(); err != nil {
 			return err
@@ -487,19 +501,19 @@ type File struct {
 }
 
 func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
-	blob, err := fs.bs.Get(m.Hash)
-	if err != nil {
-		return nil, err
-	}
-	m2, err := meta.NewMetaFromBlob(m.Hash, blob)
-	if err != nil {
-		return nil, err
-	}
+	// blob, err := fs.bs.Get(m.Hash)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// m2, err := meta.NewMetaFromBlob(m.Hash, blob)
+	// if err != nil {
+	// 	return nil, err
+	// }
 	return &File{
 		parent: parent,
 		fs:     fs,
-		Meta:   m2,
-		log:    fs.log.New("ref", m2.Hash[:10], "name", m2.Name, "type", "file"),
+		Meta:   m,
+		log:    fs.log.New("ref", m.Hash[:10], "name", m.Name, "type", "file"),
 	}, nil
 }
 
@@ -548,6 +562,8 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		if err != nil {
 			return err
 		}
+		f.parent.mu.Lock()
+		defer f.parent.mu.Unlock()
 		f.parent.Children[m2.Name] = m2
 		if err := f.parent.save(); err != nil {
 			return err
