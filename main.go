@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	_ "encoding/json"
+	"encoding/json"
 	"flag"
 	"fmt"
 	_ "io"
@@ -23,6 +23,7 @@ import (
 	"github.com/tsileo/blobstash/ext/filetree/filetreeutil/meta"
 	"github.com/tsileo/blobstash/ext/filetree/reader/filereader"
 	"github.com/tsileo/blobstash/ext/filetree/writer"
+	"github.com/tsileo/blobstash/vkv"
 	"golang.org/x/net/context"
 	"gopkg.in/inconshreveable/log15.v2"
 )
@@ -32,6 +33,8 @@ import (
 // TODO(tsileo): use the client blobstore cache
 // TODO(tsileo): add a mutex for directory and an open bool
 // FIXME(tsileo): remove Dir.Children and rename Children2 to Children
+// TODO(tsileo): embed an HTTP server to trigger a sync
+// + a cli tool like `blobfs volume home sync` and in the future even sharing
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -45,6 +48,22 @@ var Usage = func() {
 
 var Log = log15.New()
 var stats *Stats
+
+func iterDir(dir *Dir, cb func(n fs.Node) error) error {
+	for _, node := range dir.Children2 {
+		switch n := node.(type) {
+		case *File:
+			if err := cb(n); err != nil {
+				return err
+			}
+		case *Dir:
+			if err := iterDir(n, cb); err != nil {
+				return err
+			}
+		}
+	}
+	return cb(dir)
+}
 
 func main() {
 	hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
@@ -90,7 +109,8 @@ func main() {
 	}()
 
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		// TODO(tsileo): make the time configurable
+		t := time.NewTicker(30 * time.Minute)
 		for _ = range t.C {
 			func() {
 				l := fslog.New("module", "sync")
@@ -102,6 +122,79 @@ func main() {
 				bfs.mu.Lock()
 				defer bfs.mu.Unlock()
 				defer l.Debug("Sync done")
+
+				kv, err := bfs.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+				if err != nil {
+					l.Error("Sync failed", "err", err)
+					return
+				}
+				l.Debug("last sync info", "current version", kv.Version, "lastRootVersion", bfs.lastRootVersion)
+				if kv.Version == bfs.lastRootVersion {
+					l.Info("Already in sync")
+					return
+				}
+
+				root, err := bfs.Root()
+				if err != nil {
+					l.Error("Failed to fetch root", "err", err)
+					return
+				}
+				rootDir := root.(*Dir)
+				putBlob := func(l log15.Logger, mhash string, mjs []byte) error {
+					mexists, err := bfs.bs.StatRemote(mhash)
+					if err != nil {
+						l.Error("stat failed", "err", err)
+						return err
+					}
+					if !mexists {
+						if err := bfs.bs.PutRemote(mhash, mjs); err != nil {
+							l.Error("put failed", "err", err)
+							return err
+						}
+					}
+					return nil
+				}
+				if err := iterDir(rootDir, func(node fs.Node) error {
+					switch n := node.(type) {
+					case *File:
+						mhash, mjs := n.Meta.Json()
+						if putBlob(n.log, mhash, mjs); err != nil {
+							return err
+						}
+						for _, m := range n.Meta.Refs {
+							data := m.([]interface{})
+							hash := data[1].(string)
+							exists, err := bfs.bs.StatRemote(hash)
+							if err != nil {
+								return err
+							}
+							if !exists {
+								blob, err := bfs.bs.Get(hash)
+								if err != nil {
+									return err
+								}
+								if err := bfs.bs.PutRemote(hash, blob); err != nil {
+									return err
+								}
+							}
+						}
+					case *Dir:
+						mhash, mjs := n.meta.Json()
+						if putBlob(n.log, mhash, mjs); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					l.Error("iterDir failed", "err", err)
+					return
+				}
+				bfs.lastRootVersion = kv.Version
+				// Save the vkv entry in the remote vkv API
+				if _, err := bfs.kvs.Put(kv.Key, kv.Value, kv.Version); err != nil {
+					l.Error("Sync failed", "err", err)
+					return
+				}
 			}()
 		}
 	}()
@@ -171,13 +264,14 @@ func (s *Stats) String() string {
 }
 
 type FS struct {
-	log       log15.Logger
-	kvs       *kvstore.KvStore
-	bs        *cache.Cache // blobstore.BlobStore
-	uploader  *writer.Uploader
-	immutable bool
-	name      string
-	mu        sync.Mutex // Guard for the sync goroutine
+	log             log15.Logger
+	kvs             *kvstore.KvStore
+	bs              *cache.Cache // blobstore.BlobStore
+	uploader        *writer.Uploader
+	immutable       bool
+	name            string
+	mu              sync.Mutex // Guard for the sync goroutine
+	lastRootVersion int
 }
 
 func (f *FS) Immutable() bool {
@@ -191,9 +285,39 @@ func (f *FS) Name() string {
 var rootKeyFmt = "blobfs:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
+	var saveLocally bool
+	lkv, err := f.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
+	switch err {
+	case nil:
+		root, err := root.NewFromJSON([]byte(lkv.Value))
+		if err != nil {
+			return nil, err
+		}
+		blob, err := f.bs.Get(root.Ref)
+		if err != nil {
+			return nil, err
+		}
+		m, err := meta.NewMetaFromBlob(root.Ref, blob)
+		if err != nil {
+			return nil, err
+		}
+		f.log.Debug("loaded meta root", "ref", m.Hash)
+		return NewDir(f, m, nil)
+	case vkv.ErrNotFound:
+		saveLocally = true
+	default:
+		return nil, err
+	}
+
 	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
+		f.lastRootVersion = kv.Version
+		if saveLocally {
+			if f.bs.Vkv().Put(kv.Key, kv.Value, kv.Version); err != nil {
+				return nil, err
+			}
+		}
 		root, err := root.NewFromJSON([]byte(kv.Value))
 		if err != nil {
 			return nil, err
@@ -451,7 +575,6 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
 func (d *Dir) save(sync bool) error {
 	d.log.Debug("saving")
-	// FIXME(tsileo): this should only be done when syncing the tree but in a different func
 	m := meta.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
@@ -482,19 +605,17 @@ func (d *Dir) save(sync bool) error {
 			return err
 		}
 	}
-	// if d.parent == nil {
-	// 	// If no parent, this is the root so save the ref
-	// 	root := root.New(mhash)
-	// 	js, err := json.Marshal(root)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	if _, err := d.fs.kvs.Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
-	// 		return err
-	// 	}
-	// }
-	// return nil
-	// }
+	if d.parent == nil {
+		// If no parent, this is the root so save the ref
+		root := root.New(mhash)
+		js, err := json.Marshal(root)
+		if err != nil {
+			return err
+		}
+		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
+			return err
+		}
+	}
 	if d.parent != nil {
 		d.parent.mu.Lock()
 		defer d.parent.mu.Unlock()
@@ -502,19 +623,6 @@ func (d *Dir) save(sync bool) error {
 		if err := d.parent.save(sync); err != nil {
 			return err
 		}
-	} else {
-		// FIXME(tsileo): do this manually once all the files have been synced
-		// if sync {
-		// 	// If no parent, this is the root so save the ref
-		// 	root := root.New(mhash)
-		// 	js, err := json.Marshal(root)
-		// 	if err != nil {
-		// 		return err
-		// 	}
-		// 	if _, err := d.fs.kvs.Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
-		// 		return err
-		// 	}
-		// }
 	}
 	return nil
 }
@@ -629,34 +737,6 @@ type ClosingBuffer struct {
 }
 
 func (*ClosingBuffer) Close() error {
-	return nil
-}
-
-// Save will trigger
-func (f *File) save(sync bool) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.log.Debug("saving...")
-	defer f.log.Debug("save END")
-	if f.fs.Immutable() {
-		return nil
-	}
-	// XXX(tsileo): data will be saved once the tree will be synced
-	buf := bytes.NewBuffer(f.data)
-	m2, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
-	// f.log.Debug("WriteResult", "wr", wr)
-	if err != nil {
-		return err
-	}
-	f.parent.mu.Lock()
-	defer f.parent.mu.Unlock()
-	f.parent.Children[m2.Name] = m2
-	if err := f.parent.save(false); err != nil {
-		return err
-	}
-	f.Meta = m2
-	f.log = f.log.New("ref", m2.Hash)
-	f.log.Debug("saved")
 	return nil
 }
 
