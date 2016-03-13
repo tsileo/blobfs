@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
+	_ "io/ioutil"
 	"os"
 	"strings"
 	"sync"
@@ -192,13 +192,14 @@ func (f *FS) Root() (fs.Node, error) {
 			Name:      "_root",
 			Children:  map[string]*meta.Meta{},
 			Children2: map[string]fs.Node{},
+			meta:      &meta.Meta{},
 		}
 		root.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 		if err := root.save(); err != nil {
 			return nil, err
 		}
 		f.log.Debug("Creating a new root", "ref", root.meta.Hash)
-		root.log = root.log.New("ref", root.meta.Hash[:10])
+		root.log = root.log.New("ref", root.meta.Hash)
 		return root, nil
 	default:
 		return nil, err
@@ -247,7 +248,7 @@ func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 		Name:      m.Name,
 		Children:  map[string]*meta.Meta{},
 		Children2: map[string]fs.Node{},
-		log:       rfs.log.New("ref", m.Hash[:10], "name", m.Name, "type", "dir"),
+		log:       rfs.log.New("ref", m.Hash, "name", m.Name, "type", "dir"),
 	}
 	for _, ref := range d.meta.Refs {
 		blob, err := rfs.bs.Get(ref.(string))
@@ -387,6 +388,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		Name:      req.Name,
 		Children:  map[string]*meta.Meta{},
 		Children2: map[string]fs.Node{},
+		meta:      &meta.Meta{},
 	}
 	newdir.log = d.fs.log.New("ref", "unknown", "name", req.Name, "type", "dir")
 	if err := newdir.save(); err != nil {
@@ -395,10 +397,11 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.Children[newdir.Name] = newdir.meta
+	d.Children2[newdir.Name] = newdir
 	if err := d.save(); err != nil {
 		return nil, err
 	}
-	newdir.log = newdir.log.New("ref", newdir.meta.Hash[:10])
+	newdir.log = newdir.log.New("ref", newdir.meta.Hash)
 
 	stats.Lock()
 	stats.updated = true
@@ -426,28 +429,30 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
 func (d *Dir) save() error {
 	d.log.Debug("saving")
+	// FIXME(tsileo): this should only be done when syncing the tree but in a different func
 	m := meta.NewMeta()
 	m.Type = "dir"
 	m.Name = d.Name
 	m.Mode = uint32(os.ModeDir | 0555)
 	m.ModTime = time.Now().Format(time.RFC3339)
-	for _, c := range d.Children {
-		m.AddRef(c.Hash)
-	}
-	mhash, mjs := m.Json()
+	// FIXME(tsileo): renable this
+	// for _, c := range d.Children {
+	// 	m.AddRef(c.Hash)
+	// }
+	mhash, _ := m.Json() // mhash, mjs
 	m.Hash = mhash
 	d.meta = m
-	mexists, err := d.fs.bs.Stat(mhash)
-	if err != nil {
-		d.log.Error("stat failed", "err", err)
-		return err
-	}
-	if !mexists {
-		if err := d.fs.bs.Put(mhash, mjs); err != nil {
-			d.log.Error("put failed", "err", err)
-			return err
-		}
-	}
+	// mexists, err := d.fs.bs.Stat(mhash)
+	// if err != nil {
+	// 	d.log.Error("stat failed", "err", err)
+	// 	return err
+	// }
+	// if !mexists {
+	// 	if err := d.fs.bs.Put(mhash, mjs); err != nil {
+	// 		d.log.Error("put failed", "err", err)
+	// 		return err
+	// 	}
+	// }
 	if d.parent != nil {
 		d.parent.mu.Lock()
 		defer d.parent.mu.Unlock()
@@ -543,7 +548,7 @@ func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
 		parent: parent,
 		fs:     fs,
 		Meta:   m,
-		log:    fs.log.New("ref", m.Hash[:10], "name", m.Name, "type", "file"),
+		log:    fs.log.New("ref", m.Hash, "name", m.Name, "type", "file"),
 	}, nil
 }
 
@@ -585,22 +590,24 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	if f.fs.Immutable() {
 		return nil
 	}
+	f.Meta.Size = len(f.data)
 	if f.data != nil && len(f.data) > 0 {
-		buf := bytes.NewBuffer(f.data)
-		m2, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
-		// f.log.Debug("WriteResult", "wr", wr)
-		if err != nil {
-			return err
-		}
-		f.parent.mu.Lock()
-		defer f.parent.mu.Unlock()
-		f.parent.Children[m2.Name] = m2
-		if err := f.parent.save(); err != nil {
-			return err
-		}
-		f.Meta = m2
-		f.log = f.log.New("ref", m2.Hash[:10])
-		f.log.Debug("Flushed")
+		// XXX(tsileo): data will be saved once the tree will be synced
+		// buf := bytes.NewBuffer(f.data)
+		// m2, err := f.fs.uploader.PutReader(f.Meta.Name, &ClosingBuffer{buf})
+		// // f.log.Debug("WriteResult", "wr", wr)
+		// if err != nil {
+		// 	return err
+		// }
+		// f.parent.mu.Lock()
+		// defer f.parent.mu.Unlock()
+		// f.parent.Children[m2.Name] = m2
+		// if err := f.parent.save(); err != nil {
+		// 	return err
+		// }
+		// f.Meta = m2
+		// f.log = f.log.New("ref", m2.Hash[:10])
+		f.log.Debug("Flushed", "data_len", len(f.data))
 	}
 	return nil
 }
@@ -672,10 +679,17 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
 	f.log.Debug("OP Open")
 	defer f.log.Debug("OP Open END")
-	if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
-		f.log.Debug("Open with fakefile")
-		f.FakeFile = filereader.NewFile(f.fs.bs, f.Meta)
-	}
+	// if (f.data == nil || len(f.data) == 0) && len(f.Meta.Refs) > 0 {
+	// 	if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
+	// 		f.log.Debug("Open with fakefile")
+	// 		f.FakeFile = filereader.NewFile(f.fs.bs, f.Meta)
+	// 		var err error
+	// 		f.data, err = ioutil.ReadAll(f.FakeFile)
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 	}
+	// }
 	return f, nil
 }
 
@@ -700,24 +714,24 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
-	if f.FakeFile != nil {
-		// if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
-		if req.Offset >= int64(f.Meta.Size) {
-			return nil
-		}
-		buf := make([]byte, req.Size)
-		n, err := f.FakeFile.ReadAt(buf, req.Offset)
-		if err == io.EOF {
-			err = nil
-		}
-		if err != nil {
-			return fuse.EIO
-		}
-		res.Data = buf[:n]
-	} else {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		fuseutil.HandleRead(req, res, f.data)
-	}
+	// if f.FakeFile != nil {
+	// 	// if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
+	// 	if req.Offset >= int64(f.Meta.Size) {
+	// 		return nil
+	// 	}
+	// 	buf := make([]byte, req.Size)
+	// 	n, err := f.FakeFile.ReadAt(buf, req.Offset)
+	// 	if err == io.EOF {
+	// 		err = nil
+	// 	}
+	// 	if err != nil {
+	// 		return fuse.EIO
+	// 	}
+	// 	res.Data = buf[:n]
+	// } else {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fuseutil.HandleRead(req, res, f.data)
+	// }
 	return nil
 }
