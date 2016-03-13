@@ -188,9 +188,10 @@ func (f *FS) Root() (fs.Node, error) {
 		return NewDir(f, m, nil)
 	case kvstore.ErrKeyNotFound:
 		root := &Dir{
-			fs:       f,
-			Name:     "_root",
-			Children: map[string]*meta.Meta{},
+			fs:        f,
+			Name:      "_root",
+			Children:  map[string]*meta.Meta{},
+			Children2: map[string]fs.Node{},
 		}
 		root.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 		if err := root.save(); err != nil {
@@ -228,26 +229,28 @@ func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
 
 // Dir implements both Node and Handle for the root directory.
 type Dir struct {
-	fs       *FS
-	meta     *meta.Meta
-	parent   *Dir
-	Name     string
-	Children map[string]*meta.Meta
-	log      log15.Logger
-	mu       sync.Mutex
+	fs        *FS
+	meta      *meta.Meta
+	parent    *Dir
+	Name      string
+	Children  map[string]*meta.Meta
+	Children2 map[string]fs.Node
+	log       log15.Logger
+	mu        sync.Mutex
 }
 
-func NewDir(fs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
+func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 	d := &Dir{
-		fs:       fs,
-		meta:     m,
-		parent:   parent,
-		Name:     m.Name,
-		Children: map[string]*meta.Meta{},
-		log:      fs.log.New("ref", m.Hash[:10], "name", m.Name, "type", "dir"),
+		fs:        rfs,
+		meta:      m,
+		parent:    parent,
+		Name:      m.Name,
+		Children:  map[string]*meta.Meta{},
+		Children2: map[string]fs.Node{},
+		log:       rfs.log.New("ref", m.Hash[:10], "name", m.Name, "type", "dir"),
 	}
 	for _, ref := range d.meta.Refs {
-		blob, err := fs.bs.Get(ref.(string))
+		blob, err := rfs.bs.Get(ref.(string))
 		if err != nil {
 			return nil, err
 		}
@@ -256,6 +259,19 @@ func NewDir(fs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 			return d, err
 		}
 		d.Children[m.Name] = m
+		if m.IsDir() {
+			ndir, err := NewDir(rfs, m, d)
+			if err != nil {
+				return nil, err
+			}
+			d.Children2[m.Name] = ndir
+		} else {
+			nfile, err := NewFile(rfs, m, d)
+			if err != nil {
+				return nil, err
+			}
+			d.Children2[m.Name] = nfile
+		}
 	}
 	return d, nil
 }
@@ -269,8 +285,9 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
-	if m, ok := d.Children[req.OldName]; ok {
+	if node, ok := d.Children2[req.OldName]; ok {
 		// FIXME(tsileo): update the name of the meta
+		m := d.Children[req.OldName]
 		m2, err := d.fs.uploader.RenameMeta(m, req.NewName)
 		if err != nil {
 			return err
@@ -279,6 +296,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		defer d.mu.Unlock()
 		// Delete the source
 		delete(d.Children, req.OldName)
+		delete(d.Children2, req.OldName)
 		if err := d.save(); err != nil {
 			return err
 		}
@@ -288,6 +306,15 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 			defer ndir.mu.Unlock()
 		}
 		ndir.Children[req.NewName] = m2
+		ndir.Children2[req.NewName] = node
+		switch n := node.(type) {
+		case *Dir:
+			n.Name = req.NewName
+			n.meta = m2
+		case *File:
+			n.Meta = m2
+		}
+		ndir.Children2[req.NewName] = node
 		if err := ndir.save(); err != nil {
 			return err
 		}
@@ -315,12 +342,13 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		}
 	}
 	// normal lookup operation
-	if c, ok := d.Children[name]; ok {
-		if c.IsFile() {
-			return NewFile(d.fs, c, d)
-		} else {
-			return NewDir(d.fs, c, d)
-		}
+	if c, ok := d.Children2[name]; ok {
+		return c, nil
+		// if c.IsFile() {
+		// 	return NewFile(d.fs, c, d)
+		// } else {
+		// 	return NewDir(d.fs, c, d)
+		// }
 	}
 	return nil, fuse.ENOENT
 }
@@ -354,10 +382,11 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		return nil, fuse.EPERM
 	}
 	newdir := &Dir{
-		fs:       d.fs,
-		parent:   d,
-		Name:     req.Name,
-		Children: map[string]*meta.Meta{},
+		fs:        d.fs,
+		parent:    d,
+		Name:      req.Name,
+		Children:  map[string]*meta.Meta{},
+		Children2: map[string]fs.Node{},
 	}
 	newdir.log = d.fs.log.New("ref", "unknown", "name", req.Name, "type", "dir")
 	if err := newdir.save(); err != nil {
@@ -480,6 +509,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		return nil, nil, err
 	}
 	d.Children[m.Name] = m
+	d.Children2[m.Name] = f
 	if err := d.save(); err != nil {
 		return nil, nil, err
 	}
