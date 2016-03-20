@@ -468,6 +468,46 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
+func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
+	d.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.meta.XAttrs == nil {
+		d.meta.XAttrs = map[string]string{}
+	}
+	d.meta.XAttrs[req.Name] = string(req.Xattr)
+	if err := d.save(false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	d.log.Debug("OP Listxattr")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.meta.XAttrs == nil {
+		return nil
+	}
+	for k, _ := range d.meta.XAttrs {
+		resp.Append(k)
+	}
+	return nil
+}
+
+func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	d.log.Debug("OP Getxattr", "name", req.Name)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.meta.XAttrs == nil {
+		return nil
+	}
+	if _, ok := d.meta.XAttrs[req.Name]; ok {
+		resp.Xattr = []byte(d.meta.XAttrs[req.Name])
+	}
+	return nil
+}
+
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
