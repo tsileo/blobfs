@@ -887,6 +887,10 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 	for k, _ := range m.XAttrs {
 		resp.Append(k)
 	}
+
+	if isPublic, ok := m.XAttrs["public"]; ok && isPublic == "1" {
+		resp.Append("url")
+	}
 	return nil
 }
 
@@ -907,6 +911,16 @@ func handleGetxattr(m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.Getxattr
 	if m.XAttrs == nil {
 		return nil
 	}
+
+	if req.Name == "url" {
+		// Ensure the node is public
+		if isPublic, ok := m.XAttrs["public"]; ok && isPublic == "1" {
+			// FIXME(tsileo): fetch the hostname from `bfs` to reconstruct an absolute URL
+			// Output the URL
+			resp.Xattr = []byte(fmt.Sprintf("/%s/%s", m.Type, m.Hash))
+		}
+	}
+
 	if _, ok := m.XAttrs[req.Name]; ok {
 		resp.Xattr = []byte(m.XAttrs[req.Name])
 	}
@@ -919,6 +933,8 @@ func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 	defer f.mu.Unlock()
 	return handleGetxattr(f.Meta, req, resp)
 }
+
+// FIXME(tsileo): handleDeletexattr
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.log.Debug("OP Attr")
