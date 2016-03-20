@@ -28,6 +28,8 @@ import (
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
+// FIXME(tsileo): fix the sync of new root
+
 // FIXME when saving with vim, content not available on first read?
 // FIXME(tsileo): debug the rename op
 // TODO(tsileo): use the client blobstore cache
@@ -143,7 +145,7 @@ func main() {
 				}()
 				kv, err := bfs.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
 				if err != nil {
-					l.Error("Sync failed", "err", err)
+					l.Error("Sync failed (failed to fetch the local vkv entry)", "err", err)
 					return
 				}
 				l.Debug("last sync info", "current version", kv.Version, "lastRootVersion", bfs.lastRootVersion)
@@ -153,8 +155,8 @@ func main() {
 				}
 				rkv, err := bfs.kvs.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
 				if err != nil {
-					if err != vkv.ErrNotFound {
-						l.Error("Sync failed", "err", err)
+					if err != kvstore.ErrKeyNotFound {
+						l.Error("Sync failed (failed to fetch the remote vkv entry)", "err", err)
 						return
 					}
 				}
@@ -230,7 +232,7 @@ func main() {
 				bfs.lastRootVersion = kv.Version
 				// Save the vkv entry in the remote vkv API
 				if _, err := bfs.kvs.Put(kv.Key, kv.Value, kv.Version); err != nil {
-					l.Error("Sync failed", "err", err)
+					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 					return
 				}
 			}()
