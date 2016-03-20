@@ -33,8 +33,15 @@ import (
 // TODO(tsileo): use the client blobstore cache
 // TODO(tsileo): add a mutex for directory and an open bool
 // FIXME(tsileo): remove Dir.Children and rename Children2 to Children
-// TODO(tsileo): embed an HTTP server to trigger a sync
+// TODO(tsileo): embed an HTTP server to:
+// - trigger a sync
+// - cache all the FS' blobs locally
+// - clean the cache
+// - see status
 // + a cli tool like `blobfs volume home sync` and in the future even sharing
+// TODO(tsileo): react on remote changes by:
+// - polling?
+// - SSE (e.g. the VKV watch endpoint)
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -110,19 +117,24 @@ func main() {
 
 	go func() {
 		// TODO(tsileo): make the time configurable
-		t := time.NewTicker(30 * time.Minute)
+		t := time.NewTicker(30 * time.Second)
 		for _ = range t.C {
 			func() {
 				l := fslog.New("module", "sync")
 				l.Debug("Sync triggered")
+
+				// Keep some basic stats about the on-going sync
+				stats := &SyncStats{}
+
 				if bfs == nil {
 					l.Debug("bfs is nil")
 					return
 				}
 				bfs.mu.Lock()
-				defer bfs.mu.Unlock()
-				defer l.Debug("Sync done")
-
+				defer func() {
+					l.Info("Sync done", "blobs_uploaded", stats.BlobsUploaded, "blobs_skipped", stats.BlobsSkipped)
+					bfs.mu.Unlock()
+				}()
 				kv, err := bfs.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
 				if err != nil {
 					l.Error("Sync failed", "err", err)
@@ -133,6 +145,18 @@ func main() {
 					l.Info("Already in sync")
 					return
 				}
+				rkv, err := bfs.kvs.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+				if err != nil {
+					if err != vkv.ErrNotFound {
+						l.Error("Sync failed", "err", err)
+						return
+					}
+				}
+
+				if rkv != nil && rkv.Version == kv.Version {
+					l.Info("Already in sync")
+					return
+				}
 
 				root, err := bfs.Root()
 				if err != nil {
@@ -140,45 +164,53 @@ func main() {
 					return
 				}
 				rootDir := root.(*Dir)
-				putBlob := func(l log15.Logger, mhash string, mjs []byte) error {
-					mexists, err := bfs.bs.StatRemote(mhash)
+				putBlob := func(l log15.Logger, hash string, blob []byte) error {
+					mexists, err := bfs.bs.StatRemote(hash)
 					if err != nil {
 						l.Error("stat failed", "err", err)
 						return err
 					}
-					if !mexists {
-						if err := bfs.bs.PutRemote(mhash, mjs); err != nil {
+					if mexists {
+						stats.BlobsSkipped++
+					} else {
+						// Fetch the blob locally via the cache if needed
+						if blob == nil {
+							blob, err = bfs.bs.Get(hash)
+							if err != nil {
+								return err
+							}
+
+						}
+						if err := bfs.bs.PutRemote(hash, blob); err != nil {
 							l.Error("put failed", "err", err)
 							return err
 						}
+						stats.BlobsUploaded++
 					}
 					return nil
 				}
 				if err := iterDir(rootDir, func(node fs.Node) error {
 					switch n := node.(type) {
 					case *File:
+						// n.mu.Lock()
+						// defer n.mu.Lock()
+						// Save the meta
 						mhash, mjs := n.Meta.Json()
 						if putBlob(n.log, mhash, mjs); err != nil {
 							return err
 						}
+						// Save all the parts of the file
 						for _, m := range n.Meta.Refs {
 							data := m.([]interface{})
 							hash := data[1].(string)
-							exists, err := bfs.bs.StatRemote(hash)
-							if err != nil {
+							if err := putBlob(n.log, hash, nil); err != nil {
 								return err
-							}
-							if !exists {
-								blob, err := bfs.bs.Get(hash)
-								if err != nil {
-									return err
-								}
-								if err := bfs.bs.PutRemote(hash, blob); err != nil {
-									return err
-								}
 							}
 						}
 					case *Dir:
+						// TODO(tsileo): fix the locking here and above
+						// n.mu.Lock()
+						// defer n.mu.Lock()
 						mhash, mjs := n.meta.Json()
 						if putBlob(n.log, mhash, mjs); err != nil {
 							return err
@@ -241,6 +273,13 @@ func main() {
 		fslog.Crit("mount error", "err", err)
 		os.Exit(1)
 	}
+
+	// FIXME(tsileo): listen on signals and unmount / close the cache
+}
+
+type SyncStats struct {
+	BlobsUploaded int
+	BlobsSkipped  int
 }
 
 type Stats struct {
@@ -768,6 +807,50 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		// f.log = f.log.New("ref", m2.Hash[:10])
 		f.log.Debug("Flushed", "data_len", len(f.data))
 		f.flushed = true
+	}
+	return nil
+}
+
+func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
+	f.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Meta.XAttrs == nil {
+		f.Meta.XAttrs = map[string]string{}
+	}
+	f.Meta.XAttrs[req.Name] = string(req.Xattr)
+	// XXX(tsileo): check thath the parent get the updated hash?
+	f.parent.fs.uploader.PutMeta(f.Meta)
+	f.parent.mu.Lock()
+	defer f.parent.mu.Unlock()
+	if err := f.parent.save(false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	f.log.Debug("OP Listxattr")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Meta.XAttrs == nil {
+		return nil
+	}
+	for k, _ := range f.Meta.XAttrs {
+		resp.Append(k)
+	}
+	return nil
+}
+
+func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	f.log.Debug("OP Getxattr", "name", req.Name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Meta.XAttrs == nil {
+		return nil
+	}
+	if _, ok := f.Meta.XAttrs[req.Name]; ok {
+		resp.Xattr = []byte(f.Meta.XAttrs[req.Name])
 	}
 	return nil
 }
