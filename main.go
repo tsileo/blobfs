@@ -45,6 +45,12 @@ import (
 
 const maxInt = int(^uint(0) >> 1)
 
+var virtualXAttrs = map[string]func(*meta.Meta) []byte{
+	"ref": func(m *meta.Meta) []byte {
+		return []byte(m.Hash)
+	},
+}
+
 var bfs *FS
 
 var Usage = func() {
@@ -472,6 +478,12 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	d.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// Prevent writing attributes name that are virtual attributes
+	if _, exists := virtualXAttrs[req.Name]; exists {
+		return nil
+	}
+
 	if d.meta.XAttrs == nil {
 		d.meta.XAttrs = map[string]string{}
 	}
@@ -486,26 +498,14 @@ func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *f
 	d.log.Debug("OP Listxattr")
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.meta.XAttrs == nil {
-		return nil
-	}
-	for k, _ := range d.meta.XAttrs {
-		resp.Append(k)
-	}
-	return nil
+	return handleListxattr(d.meta, resp)
 }
 
 func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	d.log.Debug("OP Getxattr", "name", req.Name)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.meta.XAttrs == nil {
-		return nil
-	}
-	if _, ok := d.meta.XAttrs[req.Name]; ok {
-		resp.Xattr = []byte(d.meta.XAttrs[req.Name])
-	}
-	return nil
+	return handleGetxattr(d.meta, req, resp)
 }
 
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
@@ -855,6 +855,12 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	f.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	// Prevent writing attributes name that are virtual attributes
+	if _, exists := virtualXAttrs[req.Name]; exists {
+		return nil
+	}
+
 	if f.Meta.XAttrs == nil {
 		f.Meta.XAttrs = map[string]string{}
 	}
@@ -869,15 +875,40 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	return nil
 }
 
+func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
+	// Add the "virtual" eXtended Attributes
+	for vattr, _ := range virtualXAttrs {
+		resp.Append(vattr)
+	}
+
+	if m.XAttrs == nil {
+		return nil
+	}
+	for k, _ := range m.XAttrs {
+		resp.Append(k)
+	}
+	return nil
+}
+
 func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	f.log.Debug("OP Listxattr")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.Meta.XAttrs == nil {
+	return handleListxattr(f.Meta, resp)
+}
+
+func handleGetxattr(m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	// Check if the request match a virtual extended attributes
+	if xattrFunc, ok := virtualXAttrs[req.Name]; ok {
+		resp.Xattr = xattrFunc(m)
 		return nil
 	}
-	for k, _ := range f.Meta.XAttrs {
-		resp.Append(k)
+
+	if m.XAttrs == nil {
+		return nil
+	}
+	if _, ok := m.XAttrs[req.Name]; ok {
+		resp.Xattr = []byte(m.XAttrs[req.Name])
 	}
 	return nil
 }
@@ -886,13 +917,7 @@ func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 	f.log.Debug("OP Getxattr", "name", req.Name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.Meta.XAttrs == nil {
-		return nil
-	}
-	if _, ok := f.Meta.XAttrs[req.Name]; ok {
-		resp.Xattr = []byte(f.Meta.XAttrs[req.Name])
-	}
-	return nil
+	return handleGetxattr(f.Meta, req, resp)
 }
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
