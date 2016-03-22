@@ -7,7 +7,9 @@ import (
 	"fmt"
 	_ "io"
 	"io/ioutil"
+	_ "net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +18,7 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
+	_ "github.com/tent/hawk-go"
 	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/client/blobstore"
 	"github.com/tsileo/blobstash/client/blobstore/cache"
@@ -28,12 +31,9 @@ import (
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
-// FIXME(tsileo): fix the sync of new root
+// XXX(tsileo): consider rewriting the init using the filetree API
+// FIXME(tsileo): implement Seek interface for File
 
-// FIXME when saving with vim, content not available on first read?
-// FIXME(tsileo): debug the rename op
-// TODO(tsileo): use the client blobstore cache
-// TODO(tsileo): add a mutex for directory and an open bool
 // FIXME(tsileo): remove Dir.Children and rename Children2 to Children
 // TODO(tsileo): embed an HTTP server to:
 // - trigger a sync
@@ -45,12 +45,15 @@ import (
 // - polling?
 // - SSE (e.g. the VKV watch endpoint)
 
+// TODO(tsileo): fetch the Hawk key and build the url virtual xattr with bewit within BlobFS
+
 const maxInt = int(^uint(0) >> 1)
 
 var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 	"ref": func(m *meta.Meta) []byte {
 		return []byte(m.Hash)
 	},
+	"url": nil, // Will be computed dynamically
 }
 
 var bfs *FS
@@ -64,6 +67,7 @@ var Usage = func() {
 var Log = log15.New()
 var stats *Stats
 
+// iterDir executes the given callback `cb` on each nodes (file or dir) recursively.
 func iterDir(dir *Dir, cb func(n fs.Node) error) error {
 	for _, node := range dir.Children2 {
 		switch n := node.(type) {
@@ -125,7 +129,7 @@ func main() {
 
 	go func() {
 		// TODO(tsileo): make the time configurable
-		t := time.NewTicker(30 * time.Second)
+		t := time.NewTicker(60 * time.Second)
 		for _ = range t.C {
 			func() {
 				l := fslog.New("module", "sync")
@@ -172,6 +176,7 @@ func main() {
 					return
 				}
 				rootDir := root.(*Dir)
+				// putBlob will try to upload all missing blobs to the remote BlobStash instance
 				putBlob := func(l log15.Logger, hash string, blob []byte) error {
 					mexists, err := bfs.bs.StatRemote(hash)
 					if err != nil {
@@ -247,8 +252,21 @@ func main() {
 	kvsOpts.SnappyCompression = false
 	kvs := kvstore.New(kvsOpts)
 
-	//ls.Ls(kvs)
-	//os.Exit(2)
+	// Fetch the Hawk key for creating sharing URL (using Bewit)
+	// hawkResp, err := bs.Client().DoReq("GET", "/api/v1/perms/hawk", nil, nil)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// if hawkResp.StatusCode != 200 {
+	// 	panic("failed to fetch Hawk key")
+	// }
+	// k := struct {
+	// 	Key string `json:"key"`
+	// }{}
+	// if err := json.NewDecoder(hawkResp.Body).Decode(&k); err != nil {
+	// 	panic(err)
+	// }
+
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName("blobfs"),
@@ -256,11 +274,27 @@ func main() {
 		fuse.LocalVolume(),
 		fuse.VolumeName("BlobFS"),
 	)
+
 	if err != nil {
 		fslog.Crit("failed to mount", "err", err)
 		os.Exit(1)
 	}
-	defer c.Close()
+	// FIXME(tsileo): handle shutdown
+	// go func() {
+	// 	cs := make(chan os.Signal, 1)
+	// 	signal.Notify(cs, os.Interrupt,
+	// 		syscall.SIGHUP,
+	// 		syscall.SIGINT,
+	// 		syscall.SIGTERM,
+	// 		syscall.SIGQUIT)
+	// 	<-cs
+	// 	// c.Close()
+	// 	fslog.Info("Unmounting...")
+	// 	// bfs.bs.Close()
+	// 	c.Close()
+	// 	fuse.Unmount(mountpoint)
+	// 	os.Exit(0)
+	// }()
 	bfs = &FS{
 		log:       fslog,
 		name:      name,
@@ -268,21 +302,43 @@ func main() {
 		kvs:       kvs,
 		uploader:  writer.NewUploader(bs),
 		immutable: *immutablePtr,
+		host:      bsOpts.Host,
+		hawkKey:   k.Key,
 	}
-	err = fs.Serve(c, bfs)
-	if err != nil {
-		fslog.Crit("failed to serve", "err", err)
-		os.Exit(1)
-	}
+	defer bfs.bs.Close()
+	go func() {
+		err = fs.Serve(c, bfs)
+		if err != nil {
+			fslog.Crit("failed to serve", "err", err)
+			os.Exit(1)
+		}
 
-	// check if the mount process has an error to report
-	<-c.Ready
-	if err := c.MountError; err != nil {
-		fslog.Crit("mount error", "err", err)
-		os.Exit(1)
-	}
+		// check if the mount process has an error to report
+		<-c.Ready
+		fslog.Debug("ready")
+		if err := c.MountError; err != nil {
+			fslog.Crit("mount error", "err", err)
+			os.Exit(1)
+		}
+	}()
 
-	// FIXME(tsileo): listen on signals and unmount / close the cache
+	cs := make(chan os.Signal, 1)
+	signal.Notify(cs, os.Interrupt,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT)
+	<-cs
+	fslog.Info("Unmounting...")
+	bfs.bs.Close()
+	if err := c.Close(); err != nil {
+		fslog.Error("failed to close the FUSE connection", "err", err)
+	}
+	if err := fuse.Unmount(mountpoint); err != nil {
+		fslog.Error("failed to unmount", "err", err)
+	}
+	// 	os.Exit(0)
+
 }
 
 type SyncStats struct {
@@ -317,9 +373,27 @@ type FS struct {
 	uploader        *writer.Uploader
 	immutable       bool
 	name            string
+	host            string
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
+	hawkKey         string
 }
+
+// Bewit appID
+var appID = "blobstash"
+
+// newBewit returns a `bewit` token valid for the given delay
+// func (fs *FS) newBewit(url string, delay time.Duration) (string, error) {
+// 	auth, err := hawk.NewURLAuth(url, &hawk.Credentials{
+// 		ID:   appID,
+// 		Key:  fs.hawkKey,
+// 		Hash: sha256.New,
+// 	}, delay)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	return auth.Bewit(), nil
+// }
 
 func (f *FS) Immutable() bool {
 	return f.immutable
@@ -507,7 +581,7 @@ func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fus
 	d.log.Debug("OP Getxattr", "name", req.Name)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return handleGetxattr(d.meta, req, resp)
+	return handleGetxattr(d.fs, d.meta, req, resp)
 }
 
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
@@ -879,8 +953,10 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 
 func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 	// Add the "virtual" eXtended Attributes
-	for vattr, _ := range virtualXAttrs {
-		resp.Append(vattr)
+	for vattr, xattrFunc := range virtualXAttrs {
+		if xattrFunc != nil {
+			resp.Append(vattr)
+		}
 	}
 
 	if m.XAttrs == nil {
@@ -903,9 +979,9 @@ func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *
 	return handleListxattr(f.Meta, resp)
 }
 
-func handleGetxattr(m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	// Check if the request match a virtual extended attributes
-	if xattrFunc, ok := virtualXAttrs[req.Name]; ok {
+	if xattrFunc, ok := virtualXAttrs[req.Name]; ok && xattrFunc != nil {
 		resp.Xattr = xattrFunc(m)
 		return nil
 	}
@@ -919,7 +995,8 @@ func handleGetxattr(m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.Getxattr
 		if isPublic, ok := m.XAttrs["public"]; ok && isPublic == "1" {
 			// FIXME(tsileo): fetch the hostname from `bfs` to reconstruct an absolute URL
 			// Output the URL
-			resp.Xattr = []byte(fmt.Sprintf("/%s/%s", m.Type, m.Hash))
+			raw_url := fmt.Sprintf("%s/%s/%s", fs.host, m.Type[0:1], m.Hash)
+			resp.Xattr = []byte(raw_url)
 		}
 	}
 
@@ -933,7 +1010,7 @@ func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 	f.log.Debug("OP Getxattr", "name", req.Name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return handleGetxattr(f.Meta, req, resp)
+	return handleGetxattr(f.parent.fs, f.Meta, req, resp)
 }
 
 // FIXME(tsileo): handleDeletexattr
