@@ -412,9 +412,6 @@ type FS struct {
 	lastRootVersion int
 }
 
-// Bewit appID
-var appID = "blobstash"
-
 // newBewit returns a `bewit` token valid for the given delay
 // func (fs *FS) newBewit(url string, delay time.Duration) (string, error) {
 // 	auth, err := hawk.NewURLAuth(url, &hawk.Credentials{
@@ -601,6 +598,31 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 		return err
 	}
 	return nil
+}
+
+func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
+	d.log.Debug("OP Removexattr", "name", req.Name)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Can't delete virtual attributes
+	if _, exists := virtualXAttrs[req.Name]; exists {
+		return fuse.ErrNoXattr
+	}
+
+	if d.meta.XAttrs == nil {
+		return fuse.ErrNoXattr
+	}
+
+	if _, ok := d.meta.XAttrs[req.Name]; ok {
+		// Delete the attribute
+		delete(d.meta.XAttrs, req.Name)
+		if err := d.save(false); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fuse.ErrNoXattr
 }
 
 func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
@@ -1020,7 +1042,7 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 	}
 
 	if m.XAttrs == nil {
-		return nil
+		return fuse.ErrNoXattr
 	}
 
 	if req.Name == "url" {
@@ -1035,8 +1057,9 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 
 	if _, ok := m.XAttrs[req.Name]; ok {
 		resp.Xattr = []byte(m.XAttrs[req.Name])
+		return nil
 	}
-	return nil
+	return fuse.ErrNoXattr
 }
 
 func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
@@ -1044,6 +1067,37 @@ func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return handleGetxattr(f.parent.fs, f.Meta, req, resp)
+}
+
+func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
+	f.log.Debug("OP Removexattr", "name", req.Name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Can't delete virtual attributes
+	if _, exists := virtualXAttrs[req.Name]; exists {
+		return fuse.ErrNoXattr
+	}
+
+	if f.Meta.XAttrs == nil {
+		return fuse.ErrNoXattr
+	}
+
+	if _, ok := f.Meta.XAttrs[req.Name]; ok {
+		// Delete the attribute
+		delete(f.Meta.XAttrs, req.Name)
+
+		// Save the meta
+		f.parent.fs.uploader.PutMeta(f.Meta)
+		f.parent.mu.Lock()
+		defer f.parent.mu.Unlock()
+		if err := f.parent.save(false); err != nil {
+			return err
+		}
+		return nil
+
+	}
+	return fuse.ErrNoXattr
 }
 
 // FIXME(tsileo): handleDeletexattr
