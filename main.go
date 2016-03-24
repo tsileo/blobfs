@@ -9,7 +9,9 @@ import (
 	"io/ioutil"
 	_ "net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,7 +20,6 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
-	_ "github.com/tent/hawk-go"
 	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/client/blobstore"
 	"github.com/tsileo/blobstash/client/blobstore/cache"
@@ -44,8 +45,6 @@ import (
 // TODO(tsileo): react on remote changes by:
 // - polling?
 // - SSE (e.g. the VKV watch endpoint)
-
-// TODO(tsileo): fetch the Hawk key and build the url virtual xattr with bewit within BlobFS
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -82,6 +81,39 @@ func iterDir(dir *Dir, cb func(n fs.Node) error) error {
 		}
 	}
 	return cb(dir)
+}
+
+// Borrowed from https://github.com/ipfs/go-ipfs/blob/master/fuse/mount/mount.go
+func unmount(mountpoint string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("diskutil", "umount", "force", mountpoint)
+	case "linux":
+		cmd = exec.Command("fusermount", "-u", mountpoint)
+	default:
+		return fmt.Errorf("unmount: unimplemented")
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		defer close(errc)
+
+		// try vanilla unmount first.
+		if err := exec.Command("umount", mountpoint).Run(); err == nil {
+			return
+		}
+
+		// retry to unmount with the fallback cmd
+		errc <- cmd.Run()
+	}()
+
+	select {
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("umount timeout")
+	case err := <-errc:
+		return err
+	}
 }
 
 func main() {
@@ -274,7 +306,7 @@ func main() {
 		fuse.LocalVolume(),
 		fuse.VolumeName("BlobFS"),
 	)
-
+	defer c.Close()
 	if err != nil {
 		fslog.Crit("failed to mount", "err", err)
 		os.Exit(1)
@@ -303,10 +335,10 @@ func main() {
 		uploader:  writer.NewUploader(bs),
 		immutable: *immutablePtr,
 		host:      bsOpts.Host,
-		hawkKey:   k.Key,
 	}
-	defer bfs.bs.Close()
+	var wg sync.WaitGroup
 	go func() {
+		wg.Add(1)
 		err = fs.Serve(c, bfs)
 		if err != nil {
 			fslog.Crit("failed to serve", "err", err)
@@ -320,6 +352,11 @@ func main() {
 			fslog.Crit("mount error", "err", err)
 			os.Exit(1)
 		}
+		if err := c.Close(); err != nil {
+			fslog.Crit("failed to close connection", "err", err)
+		}
+		bfs.bs.Close()
+		wg.Done()
 	}()
 
 	cs := make(chan os.Signal, 1)
@@ -330,15 +367,12 @@ func main() {
 		syscall.SIGQUIT)
 	<-cs
 	fslog.Info("Unmounting...")
-	bfs.bs.Close()
-	if err := c.Close(); err != nil {
-		fslog.Error("failed to close the FUSE connection", "err", err)
+	if err := unmount(mountpoint); err != nil {
+		fslog.Crit("failed to unmount", "err", err)
+		os.Exit(1)
 	}
-	if err := fuse.Unmount(mountpoint); err != nil {
-		fslog.Error("failed to unmount", "err", err)
-	}
-	// 	os.Exit(0)
-
+	wg.Wait()
+	os.Exit(0)
 }
 
 type SyncStats struct {
@@ -376,7 +410,6 @@ type FS struct {
 	host            string
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
-	hawkKey         string
 }
 
 // Bewit appID
