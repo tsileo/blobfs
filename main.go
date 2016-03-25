@@ -80,12 +80,25 @@ type API struct {
 }
 
 func (api *API) Serve() error {
+	http.HandleFunc("/", apiIndexHandler)
 	http.HandleFunc("/stats", apiStatsHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
+	http.HandleFunc("/public", apiPublicHandler)
 	return http.ListenAndServe("localhost:8049", nil)
 }
 
+func apiIndexHandler(w http.ResponseWriter, r *http.Request) {
+	WriteJSON(w, map[string]interface{}{
+		"stats":  bfs.host + "/stats",
+		"sync":   bfs.host + "/sync",
+		"public": bfs.host + "/public",
+	})
+}
+
 func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 	stats.Lock()
 	defer stats.Unlock()
 	WriteJSON(w, stats)
@@ -93,11 +106,20 @@ func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
 
 func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
 		return
 	}
 	bfs.sync <- struct{}{}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func apiPublicHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	// TODO(tsileo): iter the FS and output the public nodes
+	WriteJSON(w, map[string]interface{}{})
 }
 
 // iterDir executes the given callback `cb` on each nodes (file or dir) recursively.
