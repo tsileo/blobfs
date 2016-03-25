@@ -21,9 +21,9 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
+	"github.com/tsileo/blobfs/pkg/cache"
 	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/client/blobstore"
-	"github.com/tsileo/blobstash/client/blobstore/cache"
 	"github.com/tsileo/blobstash/client/kvstore"
 	"github.com/tsileo/blobstash/ext/filetree/filetreeutil/meta"
 	"github.com/tsileo/blobstash/ext/filetree/reader/filereader"
@@ -36,10 +36,8 @@ import (
 // XXX(tsileo): consider rewriting the init using the filetree API
 // FIXME(tsileo): remove Dir.Children and rename Children2 to Children
 // TODO(tsileo): embed an HTTP server to:
-// - trigger a sync
 // - cache all the FS' blobs locally
 // - clean the cache
-// - see status
 // + a cli tool like `blobfs volume home sync` and in the future even sharing
 // TODO(tsileo): react on remote changes by:
 // - polling?
@@ -52,6 +50,12 @@ var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 		return []byte(m.Hash)
 	},
 	"url": nil, // Will be computed dynamically
+	// "last_sync": func(_ *meta.Meta) []byte {
+	// 	stats.Lock()
+	// 	defer stats.Unlock()
+	// 	// TODO(tsileo): implement the lat_sync
+	// 	return []byte("")
+	// },
 }
 
 var wg sync.WaitGroup
@@ -118,7 +122,60 @@ func apiPublicHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	out := map[string]*meta.Meta{}
+	root, err := bfs.Root()
+	if err != nil {
+		panic(err)
+	}
+	rootDir := root.(*Dir)
+	if err := iterDir(rootDir, func(node fs.Node) error {
+		switch n := node.(type) {
+		case *File:
+			if n.Meta.XAttrs != nil {
+				if pub, ok := n.Meta.XAttrs["public"]; ok && pub == "1" {
+					out[n.Meta.Hash] = n.Meta
+				}
+			}
+		case *Dir:
+			if n.meta.XAttrs != nil {
+				if pub, ok := n.meta.XAttrs["public"]; ok && pub == "1" {
+					out[n.meta.Hash] = n.meta
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	WriteJSON(w, out)
+}
+
+func apiCacheHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	// TODO(tsileo): iter the FS and output the public nodes
+	root, err := bfs.Root()
+	if err != nil {
+		panic(err)
+	}
+	rootDir := root.(*Dir)
+	if err := iterDir(rootDir, func(node fs.Node) error {
+		switch n := node.(type) {
+		case *File:
+			for _, m := range n.Meta.Refs {
+				data := m.([]interface{})
+				hash := data[1].(string)
+				if _, err := bfs.bs.Get(hash); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
 	WriteJSON(w, map[string]interface{}{})
 }
 
@@ -1154,6 +1211,7 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 			// Output the URL
 			raw_url := fmt.Sprintf("%s/%s/%s", fs.host, m.Type[0:1], m.Hash)
 			resp.Xattr = []byte(raw_url)
+			return nil
 		}
 	}
 
