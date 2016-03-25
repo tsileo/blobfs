@@ -7,6 +7,7 @@ import (
 	"fmt"
 	_ "io"
 	"io/ioutil"
+	"net/http"
 	_ "net/http"
 	"os"
 	"os/exec"
@@ -33,8 +34,6 @@ import (
 )
 
 // XXX(tsileo): consider rewriting the init using the filetree API
-// FIXME(tsileo): implement Seek interface for File
-
 // FIXME(tsileo): remove Dir.Children and rename Children2 to Children
 // TODO(tsileo): embed an HTTP server to:
 // - trigger a sync
@@ -55,6 +54,7 @@ var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 	"url": nil, // Will be computed dynamically
 }
 
+var wg sync.WaitGroup
 var bfs *FS
 
 var Usage = func() {
@@ -65,6 +65,40 @@ var Usage = func() {
 
 var Log = log15.New()
 var stats *Stats
+
+func WriteJSON(w http.ResponseWriter, data interface{}) {
+	js, err := json.Marshal(data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(js)
+}
+
+type API struct {
+}
+
+func (api *API) Serve() error {
+	http.HandleFunc("/stats", apiStatsHandler)
+	http.HandleFunc("/sync", apiSyncHandler)
+	return http.ListenAndServe("localhost:8049", nil)
+}
+
+func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
+	stats.Lock()
+	defer stats.Unlock()
+	WriteJSON(w, stats)
+}
+
+func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	bfs.sync <- struct{}{}
+	w.WriteHeader(http.StatusNoContent)
+}
 
 // iterDir executes the given callback `cb` on each nodes (file or dir) recursively.
 func iterDir(dir *Dir, cb func(n fs.Node) error) error {
@@ -148,22 +182,96 @@ func main() {
 	Log.SetHandler(log15.LvlFilterHandler(lvl, log15.StreamHandler(os.Stdout, log15.TerminalFormat())))
 	fslog := Log.New("name", name)
 
-	stats = &Stats{}
+	stats = &Stats{LastReset: time.Now()}
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		for _ = range t.C {
 			if stats.updated {
 				fslog.Info(stats.String())
+				fslog.Debug("Flushing stats")
 				stats.Reset()
 			}
 		}
 	}()
 
 	go func() {
+		api := &API{}
+		// TODO(tsileo): make the API port configurable
+		fslog.Info("Starting API at localhost:8049")
+		if err := api.Serve(); err != nil {
+			fslog.Crit("failed to start API")
+		}
+	}()
+
+	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
+	bsOpts := blobstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
+	bsOpts.SnappyCompression = false
+	bs := cache.New(bsOpts, "blobfs_cache")
+	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
+	kvsOpts.SnappyCompression = false
+	kvs := kvstore.New(kvsOpts)
+
+	// Fetch the Hawk key for creating sharing URL (using Bewit)
+	// hawkResp, err := bs.Client().DoReq("GET", "/api/v1/perms/hawk", nil, nil)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// if hawkResp.StatusCode != 200 {
+	// 	panic("failed to fetch Hawk key")
+	// }
+	// k := struct {
+	// 	Key string `json:"key"`
+	// }{}
+	// if err := json.NewDecoder(hawkResp.Body).Decode(&k); err != nil {
+	// 	panic(err)
+	// }
+
+	c, err := fuse.Mount(
+		mountpoint,
+		fuse.FSName("blobfs"),
+		fuse.Subtype("blobfs"),
+		fuse.LocalVolume(),
+		fuse.VolumeName("BlobFS"),
+	)
+	defer c.Close()
+	if err != nil {
+		fslog.Crit("failed to mount", "err", err)
+		os.Exit(1)
+	}
+	// FIXME(tsileo): handle shutdown
+	// go func() {
+	// 	cs := make(chan os.Signal, 1)
+	// 	signal.Notify(cs, os.Interrupt,
+	// 		syscall.SIGHUP,
+	// 		syscall.SIGINT,
+	// 		syscall.SIGTERM,
+	// 		syscall.SIGQUIT)
+	// 	<-cs
+	// 	// c.Close()
+	// 	fslog.Info("Unmounting...")
+	// 	// bfs.bs.Close()
+	// 	c.Close()
+	// 	fuse.Unmount(mountpoint)
+	// 	os.Exit(0)
+	// }()
+	bfs = &FS{
+		log:       fslog,
+		name:      name,
+		bs:        bs,
+		kvs:       kvs,
+		uploader:  writer.NewUploader(bs),
+		immutable: *immutablePtr,
+		host:      bsOpts.Host,
+		sync:      make(chan struct{}),
+	}
+
+	go func() {
 		// TODO(tsileo): make the time configurable
 		t := time.NewTicker(60 * time.Second)
-		for _ = range t.C {
-			func() {
+		for {
+			sync := func() {
+				wg.Add(1)
+				defer wg.Done()
 				l := fslog.New("module", "sync")
 				l.Debug("Sync triggered")
 
@@ -272,71 +380,18 @@ func main() {
 					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 					return
 				}
-			}()
+			}
+			select {
+			case <-t.C:
+				fslog.Info("Periodic sync")
+				sync()
+			case <-bfs.sync:
+				fslog.Info("Sync triggered")
+				sync()
+			}
 		}
 	}()
 
-	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
-	bsOpts := blobstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
-	bsOpts.SnappyCompression = false
-	bs := cache.New(bsOpts, "blobfs_cache")
-	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
-	kvsOpts.SnappyCompression = false
-	kvs := kvstore.New(kvsOpts)
-
-	// Fetch the Hawk key for creating sharing URL (using Bewit)
-	// hawkResp, err := bs.Client().DoReq("GET", "/api/v1/perms/hawk", nil, nil)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// if hawkResp.StatusCode != 200 {
-	// 	panic("failed to fetch Hawk key")
-	// }
-	// k := struct {
-	// 	Key string `json:"key"`
-	// }{}
-	// if err := json.NewDecoder(hawkResp.Body).Decode(&k); err != nil {
-	// 	panic(err)
-	// }
-
-	c, err := fuse.Mount(
-		mountpoint,
-		fuse.FSName("blobfs"),
-		fuse.Subtype("blobfs"),
-		fuse.LocalVolume(),
-		fuse.VolumeName("BlobFS"),
-	)
-	defer c.Close()
-	if err != nil {
-		fslog.Crit("failed to mount", "err", err)
-		os.Exit(1)
-	}
-	// FIXME(tsileo): handle shutdown
-	// go func() {
-	// 	cs := make(chan os.Signal, 1)
-	// 	signal.Notify(cs, os.Interrupt,
-	// 		syscall.SIGHUP,
-	// 		syscall.SIGINT,
-	// 		syscall.SIGTERM,
-	// 		syscall.SIGQUIT)
-	// 	<-cs
-	// 	// c.Close()
-	// 	fslog.Info("Unmounting...")
-	// 	// bfs.bs.Close()
-	// 	c.Close()
-	// 	fuse.Unmount(mountpoint)
-	// 	os.Exit(0)
-	// }()
-	bfs = &FS{
-		log:       fslog,
-		name:      name,
-		bs:        bs,
-		kvs:       kvs,
-		uploader:  writer.NewUploader(bs),
-		immutable: *immutablePtr,
-		host:      bsOpts.Host,
-	}
-	var wg sync.WaitGroup
 	go func() {
 		wg.Add(1)
 		err = fs.Serve(c, bfs)
@@ -381,6 +436,7 @@ type SyncStats struct {
 }
 
 type Stats struct {
+	LastReset    time.Time
 	FilesCreated int
 	DirsCreated  int
 	FilesUpdated int
@@ -390,6 +446,7 @@ type Stats struct {
 }
 
 func (s *Stats) Reset() {
+	s.LastReset = time.Now()
 	s.FilesCreated = 0
 	s.DirsCreated = 0
 	s.FilesUpdated = 0
@@ -410,6 +467,7 @@ type FS struct {
 	host            string
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
+	sync            chan struct{}
 }
 
 // newBewit returns a `bewit` token valid for the given delay
@@ -623,6 +681,10 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 		return nil
 	}
 	return fuse.ErrNoXattr
+}
+
+func (d *Dir) Forget() {
+	d.log.Debug("OP Forget")
 }
 
 func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
@@ -1032,6 +1094,10 @@ func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return handleListxattr(f.Meta, resp)
+}
+
+func (f *File) Forget() {
+	f.log.Debug("OP Forget")
 }
 
 func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
