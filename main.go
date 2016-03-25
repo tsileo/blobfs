@@ -677,8 +677,8 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if err := d.save(false); err != nil {
 		return err
 	}
-	// Trigger a sync so the file can be available for BlobStash right now
-	if req.Name == "public" && d.meta.XAttrs[req.Name] == "1" {
+	// Trigger a sync so the file will be (un)available for BlobStash right now
+	if req.Name == "public" {
 		bfs.sync <- struct{}{}
 	}
 	return nil
@@ -704,6 +704,12 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 		if err := d.save(false); err != nil {
 			return err
 		}
+
+		// Trigger a sync so the file won't be available via BlobStash
+		if req.Name == "public" && d.meta.XAttrs[req.Name] == "1" {
+			bfs.sync <- struct{}{}
+		}
+
 		return nil
 	}
 	return fuse.ErrNoXattr
@@ -1091,8 +1097,8 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if err := f.parent.save(false); err != nil {
 		return err
 	}
-	// Trigger a sync so the file can be available for BlobStash right now
-	if req.Name == "public" && f.Meta.XAttrs[req.Name] == "1" {
+	// Trigger a sync so the file will be (un)available for BlobStash right now
+	if req.Name == "public" {
 		bfs.sync <- struct{}{}
 	}
 	return nil
@@ -1189,6 +1195,10 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 		defer f.parent.mu.Unlock()
 		if err := f.parent.save(false); err != nil {
 			return err
+		}
+		// Trigger a sync so the file won't be available via BlobStash
+		if req.Name == "public" && f.Meta.XAttrs[req.Name] == "1" {
+			bfs.sync <- struct{}{}
 		}
 		return nil
 
