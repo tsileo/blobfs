@@ -677,6 +677,10 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if err := d.save(false); err != nil {
 		return err
 	}
+	// Trigger a sync so the file can be available for BlobStash right now
+	if req.Name == "public" && d.meta.XAttrs[req.Name] == "1" {
+		bfs.sync <- struct{}{}
+	}
 	return nil
 }
 
@@ -1086,6 +1090,10 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	defer f.parent.mu.Unlock()
 	if err := f.parent.save(false); err != nil {
 		return err
+	}
+	// Trigger a sync so the file can be available for BlobStash right now
+	if req.Name == "public" && f.Meta.XAttrs[req.Name] == "1" {
+		bfs.sync <- struct{}{}
 	}
 	return nil
 }
