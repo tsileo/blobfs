@@ -42,6 +42,7 @@ import (
 // TODO(tsileo): react on remote changes by:
 // - polling?
 // - SSE (e.g. the VKV watch endpoint)
+// TODO(tsileo): find a secure way to provide semi-private (Bewit signed) link
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -131,16 +132,12 @@ func apiPublicHandler(w http.ResponseWriter, r *http.Request) {
 	if err := iterDir(rootDir, func(node fs.Node) error {
 		switch n := node.(type) {
 		case *File:
-			if n.Meta.XAttrs != nil {
-				if pub, ok := n.Meta.XAttrs["public"]; ok && pub == "1" {
-					out[n.Meta.Hash] = n.Meta
-				}
+			if n.Meta.IsPublic() {
+				out[n.Meta.Hash] = n.Meta
 			}
 		case *Dir:
-			if n.meta.XAttrs != nil {
-				if pub, ok := n.meta.XAttrs["public"]; ok && pub == "1" {
-					out[n.meta.Hash] = n.meta
-				}
+			if n.meta.IsPublic() {
+				out[n.meta.Hash] = n.meta
 			}
 		}
 		return nil
@@ -763,7 +760,7 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 		}
 
 		// Trigger a sync so the file won't be available via BlobStash
-		if req.Name == "public" && d.meta.XAttrs[req.Name] == "1" {
+		if req.Name == "public" {
 			bfs.sync <- struct{}{}
 		}
 
@@ -1176,7 +1173,7 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 		resp.Append(k)
 	}
 
-	if isPublic, ok := m.XAttrs["public"]; ok && isPublic == "1" {
+	if m.IsPublic() {
 		resp.Append("url")
 	}
 	return nil
@@ -1206,7 +1203,7 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 
 	if req.Name == "url" {
 		// Ensure the node is public
-		if isPublic, ok := m.XAttrs["public"]; ok && isPublic == "1" {
+		if m.IsPublic() {
 			// FIXME(tsileo): fetch the hostname from `bfs` to reconstruct an absolute URL
 			// Output the URL
 			raw_url := fmt.Sprintf("%s/%s/%s", fs.host, m.Type[0:1], m.Hash)
@@ -1255,7 +1252,7 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 			return err
 		}
 		// Trigger a sync so the file won't be available via BlobStash
-		if req.Name == "public" && f.Meta.XAttrs[req.Name] == "1" {
+		if req.Name == "public" {
 			bfs.sync <- struct{}{}
 		}
 		return nil
@@ -1263,8 +1260,6 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 	}
 	return fuse.ErrNoXattr
 }
-
-// FIXME(tsileo): handleDeletexattr
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.log.Debug("OP Attr")
