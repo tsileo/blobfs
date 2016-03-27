@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -637,28 +636,6 @@ func (f *FS) Root() (fs.Node, error) {
 	}
 }
 
-// debugFile is a dummy file that hold a string
-type debugFile struct {
-	data []byte
-}
-
-func newDebugFile(data string) *debugFile {
-	return &debugFile{
-		data: []byte(data),
-	}
-}
-
-func (f *debugFile) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = 2
-	a.Mode = 0444
-	a.Size = uint64(len(f.data))
-	return nil
-}
-
-func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
-	return f.data, nil
-}
-
 // Dir implements both Node and Handle for the root directory.
 type Dir struct {
 	fs        *FS
@@ -831,21 +808,6 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	d.log.Debug("OP Lookup", "name", name)
 	defer d.log.Debug("OP Lookup END", "name", name)
-	// check if debug data is requested.
-	switch {
-	case name == ".blobfs":
-		// .blobfs is requested
-		// dump the current dir debug data
-		return newDebugFile(d.meta.Hash), nil
-	case strings.HasSuffix(name, ".blobfs"):
-		// returns a file meta data
-		name = strings.Replace(name, ".blobfs", "", 1)
-		if c, ok := d.Children[name]; ok {
-			if c.IsFile() {
-				return newDebugFile(c.Hash), nil
-			}
-		}
-	}
 	// normal lookup operation
 	if c, ok := d.Children2[name]; ok {
 		return c, nil
