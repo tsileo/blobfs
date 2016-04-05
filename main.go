@@ -543,6 +543,7 @@ type FS struct {
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
 	sync            chan struct{}
+	lastWrite       time.Time
 }
 
 // newBewit returns a `bewit` token valid for the given delay
@@ -1000,7 +1001,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 type File struct {
 	fs       *FS
-	data     []byte // FIXME if data grows too much, use a temp file
+	data     []byte // FIXME(tsileo): if data grows too much, use a temp file
 	Meta     *meta.Meta
 	FakeFile *filereader.File
 	log      log15.Logger
@@ -1107,15 +1108,24 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	}
 	f.Meta.XAttrs[req.Name] = string(req.Xattr)
 	// XXX(tsileo): check thath the parent get the updated hash?
-	f.parent.fs.uploader.PutMeta(f.Meta)
-	f.parent.mu.Lock()
-	defer f.parent.mu.Unlock()
-	if err := f.parent.save(false); err != nil {
+	if err := f.save(); err != nil {
 		return err
 	}
 	// Trigger a sync so the file will be (un)available for BlobStash right now
 	if req.Name == "public" {
 		bfs.sync <- struct{}{}
+	}
+	return nil
+}
+
+func (f *File) save() error {
+	// Update the new `Meta`
+	f.parent.fs.uploader.PutMeta(f.Meta)
+	// And save the parent
+	f.parent.mu.Lock()
+	defer f.parent.mu.Unlock()
+	if err := f.parent.save(false); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1207,10 +1217,7 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 		delete(f.Meta.XAttrs, req.Name)
 
 		// Save the meta
-		f.parent.fs.uploader.PutMeta(f.Meta)
-		f.parent.mu.Lock()
-		defer f.parent.mu.Unlock()
-		if err := f.parent.save(false); err != nil {
+		if err := f.save(); err != nil {
 			return err
 		}
 		// Trigger a sync so the file won't be available via BlobStash
