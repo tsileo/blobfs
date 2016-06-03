@@ -22,11 +22,11 @@ import (
 	"bazil.org/fuse/fuseutil"
 	"github.com/tsileo/blobfs/pkg/cache"
 	"github.com/tsileo/blobfs/pkg/root"
-	"github.com/tsileo/blobstash/client/blobstore"
-	"github.com/tsileo/blobstash/client/kvstore"
 	"github.com/tsileo/blobstash/ext/filetree/filetreeutil/meta"
 	"github.com/tsileo/blobstash/ext/filetree/reader/filereader"
 	"github.com/tsileo/blobstash/ext/filetree/writer"
+	"github.com/tsileo/blobstash/pkg/client/blobstore"
+	"github.com/tsileo/blobstash/pkg/client/kvstore"
 	"github.com/tsileo/blobstash/vkv"
 	"golang.org/x/net/context"
 	"gopkg.in/inconshreveable/log15.v2"
@@ -60,6 +60,8 @@ var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 
 var wg sync.WaitGroup
 var bfs *FS
+
+// XXX(tsileo): move this from blobfs to blobfs-mount
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -113,6 +115,7 @@ func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
 		return
 	}
+	// FIXME(tsileo): sync with an optional comment read from the body
 	bfs.sync <- struct{}{}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -459,7 +462,7 @@ func main() {
 			select {
 			case <-t.C:
 				fslog.Info("Periodic sync")
-				sync()
+				// sync()
 			case <-bfs.sync:
 				fslog.Info("Sync triggered")
 				sync()
@@ -530,6 +533,28 @@ func (s *Stats) Reset() {
 }
 func (s *Stats) String() string {
 	return fmt.Sprintf("%d files created, %d dirs created", s.FilesCreated, s.DirsCreated)
+}
+
+// debugFile is a dummy file that hold a string
+type debugFile struct {
+	data []byte
+}
+
+func newDebugFile(data string) *debugFile {
+	return &debugFile{
+		data: []byte(data),
+	}
+}
+
+func (f *debugFile) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Inode = 2
+	a.Mode = 0444
+	a.Size = uint64(len(f.data))
+	return nil
+}
+
+func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
+	return f.data, nil
 }
 
 type FS struct {
@@ -810,6 +835,10 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	d.log.Debug("OP Lookup", "name", name)
 	defer d.log.Debug("OP Lookup END", "name", name)
 	// normal lookup operation
+	if name == ".blobfs_url" {
+		// FIXME(tsileo): set the value dynamically
+		return newDebugFile("http://localhost:8049"), nil
+	}
 	if c, ok := d.Children2[name]; ok {
 		return c, nil
 		// if c.IsFile() {
@@ -933,6 +962,7 @@ func (d *Dir) save(sync bool) error {
 		if err != nil {
 			return err
 		}
+		// XXX(tsileo): mark1
 		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
 			return err
 		}
@@ -1221,9 +1251,9 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 			return err
 		}
 		// Trigger a sync so the file won't be available via BlobStash
-		if req.Name == "public" {
-			bfs.sync <- struct{}{}
-		}
+		// if req.Name == "public" {
+		// 	bfs.sync <- struct{}{}
+		// }
 		return nil
 
 	}

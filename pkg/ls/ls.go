@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/tsileo/blobfs/pkg/root"
-	"github.com/tsileo/blobstash/client/kvstore"
+	"github.com/tsileo/blobstash/pkg/client/kvstore"
 )
 
 func Ls(kvs *kvstore.KvStore) {

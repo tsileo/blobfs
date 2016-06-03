@@ -3,10 +3,10 @@ package cache
 import (
 	"path/filepath"
 
-	"github.com/tsileo/blobstash/backend/blobsfile"
-	"github.com/tsileo/blobstash/client/blobstore"
-	"github.com/tsileo/blobstash/client/clientutil"
-	"github.com/tsileo/blobstash/config/pathutil"
+	"github.com/tsileo/blobstash/pkg/backend/blobsfile"
+	"github.com/tsileo/blobstash/pkg/client/blobstore"
+	"github.com/tsileo/blobstash/pkg/client/clientutil"
+	"github.com/tsileo/blobstash/pkg/config/pathutil"
 	"github.com/tsileo/blobstash/vkv"
 )
 

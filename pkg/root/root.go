@@ -4,9 +4,11 @@ import "encoding/json"
 
 var Hostname = ""
 
+// XXX(tsileo): rename to commit? keep the hostname?
 type Root struct {
 	Hostname string `json:"hostname"`
 	Ref      string `json:"ref"`
+	Comment  string `json:"comment"`
 }
 
 func New(ref string) *Root {
