@@ -89,6 +89,7 @@ func (api *API) Serve() error {
 	http.HandleFunc("/", apiIndexHandler)
 	http.HandleFunc("/stats", apiStatsHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
+	http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
 	return http.ListenAndServe("localhost:8049", nil)
 }
@@ -145,6 +146,32 @@ func apiPublicHandler(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}); err != nil {
 		panic(err)
+	}
+	WriteJSON(w, out)
+}
+
+type CommitLog struct {
+	T       string `json:"t"`
+	Version int    `json:"version"`
+	Comment string `json:"comment"`
+}
+
+func apiLogHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	versions, err := bfs.kvs.Versions(fmt.Sprintf(rootKeyFmt, bfs.name), 0, -1, 0)
+	if err != nil {
+		panic(err)
+	}
+	out := []*CommitLog{}
+	for _, v := range versions.Versions {
+		out = append(out, &CommitLog{
+			T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
+			Version: v.Version,
+			Comment: "",
+		})
 	}
 	WriteJSON(w, out)
 }
