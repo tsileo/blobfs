@@ -111,13 +111,23 @@ func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, stats)
 }
 
+type SyncReq struct {
+	Comment string `json:"comment"`
+}
+
 func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
 		return
 	}
+	sr := &SyncReq{}
+	if err := json.NewDecoder(r.Body).Decode(sr); err != nil {
+		if err != nil {
+			panic(err)
+		}
+	}
 	// FIXME(tsileo): sync with an optional comment read from the body
-	bfs.sync <- struct{}{}
+	bfs.sync <- sr
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -167,10 +177,14 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []*CommitLog{}
 	for _, v := range versions.Versions {
+		croot := &root.Root{}
+		if err := json.Unmarshal([]byte(v.Value), croot); err != nil {
+			panic(err)
+		}
 		out = append(out, &CommitLog{
 			T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
 			Version: v.Version,
-			Comment: "",
+			Comment: croot.Comment,
 		})
 	}
 	WriteJSON(w, out)
@@ -367,14 +381,14 @@ func main() {
 		uploader:  writer.NewUploader(bs),
 		immutable: *immutablePtr,
 		host:      bsOpts.Host,
-		sync:      make(chan struct{}),
+		sync:      make(chan *SyncReq),
 	}
 
 	go func() {
 		// TODO(tsileo): make the time configurable
 		t := time.NewTicker(60 * time.Second)
 		for {
-			sync := func() {
+			sync := func(sr *SyncReq) {
 				wg.Add(1)
 				defer wg.Done()
 				l := fslog.New("module", "sync")
@@ -415,12 +429,12 @@ func main() {
 					return
 				}
 
-				root, err := bfs.Root()
+				oroot, err := bfs.Root()
 				if err != nil {
 					l.Error("Failed to fetch root", "err", err)
 					return
 				}
-				rootDir := root.(*Dir)
+				rootDir := oroot.(*Dir)
 				// putBlob will try to upload all missing blobs to the remote BlobStash instance
 				putBlob := func(l log15.Logger, hash string, blob []byte) error {
 					mexists, err := bfs.bs.StatRemote(hash)
@@ -481,7 +495,16 @@ func main() {
 				}
 				bfs.lastRootVersion = kv.Version
 				// Save the vkv entry in the remote vkv API
-				if _, err := bfs.kvs.Put(kv.Key, kv.Value, kv.Version); err != nil {
+				newRoot := &root.Root{}
+				if err := json.Unmarshal([]byte(kv.Value), newRoot); err != nil {
+					return
+				}
+				newRoot.Comment = sr.Comment
+				newValue, err := json.Marshal(newRoot)
+				if err != nil {
+					return
+				}
+				if _, err := bfs.kvs.Put(kv.Key, string(newValue), kv.Version); err != nil {
 					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 					return
 				}
@@ -490,9 +513,9 @@ func main() {
 			case <-t.C:
 				fslog.Info("Periodic sync")
 				// sync()
-			case <-bfs.sync:
+			case sr := <-bfs.sync:
 				fslog.Info("Sync triggered")
-				sync()
+				sync(sr)
 			}
 		}
 	}()
@@ -594,7 +617,7 @@ type FS struct {
 	host            string
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
-	sync            chan struct{}
+	sync            chan *SyncReq
 	lastWrite       time.Time
 }
 
@@ -761,10 +784,10 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if err := d.save(false); err != nil {
 		return err
 	}
-	// Trigger a sync so the file will be (un)available for BlobStash right now
-	if req.Name == "public" {
-		bfs.sync <- struct{}{}
-	}
+	// // Trigger a sync so the file will be (un)available for BlobStash right now
+	// if req.Name == "public" {
+	// 	bfs.sync <- struct{}{}
+	// }
 	return nil
 }
 
@@ -789,10 +812,10 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 			return err
 		}
 
-		// Trigger a sync so the file won't be available via BlobStash
-		if req.Name == "public" {
-			bfs.sync <- struct{}{}
-		}
+		// // Trigger a sync so the file won't be available via BlobStash
+		// if req.Name == "public" {
+		// 	bfs.sync <- struct{}{}
+		// }
 
 		return nil
 	}
@@ -1169,9 +1192,9 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 		return err
 	}
 	// Trigger a sync so the file will be (un)available for BlobStash right now
-	if req.Name == "public" {
-		bfs.sync <- struct{}{}
-	}
+	// if req.Name == "public" {
+	// 	bfs.sync <- struct{}{}
+	// }
 	return nil
 }
 

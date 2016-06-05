@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,7 +32,7 @@ func main() {
 	flag.Usage = Usage
 	flag.Parse()
 
-	if flag.NArg() != 1 {
+	if flag.NArg() < 1 {
 		Usage()
 		os.Exit(2)
 	}
@@ -48,7 +49,7 @@ func main() {
 	switch cmd {
 	case "commit":
 		fmt.Printf("comment: %v", *commentPtr)
-		if err := Commit(url); err != nil {
+		if err := Commit(url, *commentPtr); err != nil {
 			panic(err)
 		}
 	case "log":
@@ -78,14 +79,19 @@ func Log(u string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&logs); err != nil {
 		return err
 	}
+	// TODO(tsileo): add a * to the current checked out version, look how git is doing for branch
 	for _, log := range logs {
-		fmt.Printf("%s\t%v\n", log.T, log.Version)
+		fmt.Printf("%s  %v\t%s\n", log.T, log.Version, log.Comment)
 	}
 	return nil
 }
 
-func Commit(u string) error {
-	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), nil)
+func Commit(u, msg string) error {
+	body, err := json.Marshal(map[string]interface{}{"comment": msg})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
