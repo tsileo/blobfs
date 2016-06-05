@@ -12,7 +12,7 @@ import (
 
 type CommitLog struct {
 	T       string `json:"t"`
-	Version int    `json:"version"`
+	Ref     string `json:"ref"`
 	Comment string `json:"comment"`
 }
 
@@ -52,11 +52,16 @@ func main() {
 		if err := Commit(url, *commentPtr); err != nil {
 			panic(err)
 		}
+	case "checkout":
+		fmt.Printf("ref: %v", flag.Arg(1))
+		if err := Checkout(url, flag.Arg(1)); err != nil {
+			panic(err)
+		}
 	case "log":
 		if err := Log(url); err != nil {
 			panic(err)
 		}
-	case "prune", "checkout", "status":
+	case "prune", "status":
 		fmt.Printf("Not implemented yet")
 	default:
 		fmt.Printf("unknown cmd %v", cmd)
@@ -81,11 +86,29 @@ func Log(u string) error {
 	}
 	// TODO(tsileo): add a * to the current checked out version, look how git is doing for branch
 	for _, log := range logs {
-		fmt.Printf("%s  %v\t%s\n", log.T, log.Version, log.Comment)
+		fmt.Printf("%s  %v\t%s\n", log.T, log.Ref, log.Comment)
 	}
 	return nil
 }
 
+func Checkout(u, ref string) error {
+	body, err := json.Marshal(map[string]interface{}{"ref": ref})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/checkout"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == 204 {
+		return nil
+	}
+	return fmt.Errorf("http %d", resp.StatusCode)
+}
 func Commit(u, msg string) error {
 	body, err := json.Marshal(map[string]interface{}{"comment": msg})
 	if err != nil {

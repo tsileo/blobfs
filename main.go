@@ -88,6 +88,7 @@ type API struct {
 func (api *API) Serve() error {
 	http.HandleFunc("/", apiIndexHandler)
 	http.HandleFunc("/stats", apiStatsHandler)
+	http.HandleFunc("/checkout", apiCheckoutHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
 	http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
@@ -109,6 +110,29 @@ func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
 	stats.Lock()
 	defer stats.Unlock()
 	WriteJSON(w, stats)
+}
+
+type CheckoutReq struct {
+	Ref string `json:"ref"`
+}
+
+func apiCheckoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
+		return
+	}
+	cr := &CheckoutReq{}
+	if err := json.NewDecoder(r.Body).Decode(cr); err != nil {
+		if err != nil {
+			panic(err)
+		}
+	}
+	fmt.Printf("%+v", cr)
+	// FIXME(tsileo): Check if cr.Ref == lastRef, and if so make it mutable
+	if err := bfs.setRoot(cr.Ref, true); err != nil {
+		panic(err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type SyncReq struct {
@@ -162,7 +186,7 @@ func apiPublicHandler(w http.ResponseWriter, r *http.Request) {
 
 type CommitLog struct {
 	T       string `json:"t"`
-	Version int    `json:"version"`
+	Ref     string `json:"ref"`
 	Comment string `json:"comment"`
 }
 
@@ -183,7 +207,7 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, &CommitLog{
 			T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
-			Version: v.Version,
+			Ref:     croot.Ref,
 			Comment: croot.Comment,
 		})
 	}
@@ -619,6 +643,13 @@ type FS struct {
 	lastRootVersion int
 	sync            chan *SyncReq
 	lastWrite       time.Time
+	mount           *Mount
+	root            fs.Node
+}
+
+type Mount struct {
+	immutable bool
+	root      fs.Node
 }
 
 // newBewit returns a `bewit` token valid for the given delay
@@ -645,6 +676,39 @@ func (f *FS) Name() string {
 var rootKeyFmt = "blobfs:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
+	f.log.Info("OP Root")
+	if f.mount == nil {
+		f.log.Info("loadRoot")
+		d, err := f.loadRoot()
+		if err != nil {
+			return nil, err
+		}
+		f.root = d
+		return d, nil
+	}
+	f.log.Info("Root OP", "root", f.mount.root)
+	return f.mount.root, nil
+}
+
+func (f *FS) setRoot(ref string, immutable bool) error {
+	f.log.Info("setRoot", "ref", ref)
+	blob, err := f.bs.Get(ref)
+	if err != nil {
+		return err
+	}
+	m, err := meta.NewMetaFromBlob(ref, blob)
+	d, err := NewDir(f, m, nil)
+	if err != nil {
+		return err
+	}
+	f.mount = &Mount{immutable: immutable, root: d}
+	*f.root.(*Dir) = *d
+	// f.root.(*Dir).log = f.root.(*Dir).log.New("ref", d.meta.Hash)
+	// XXX(tsileo): keep the real root meta somewhere to get back to HEAD
+	return nil
+}
+
+func (f *FS) loadRoot() (fs.Node, error) {
 	var saveLocally bool
 	lkv, err := f.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
@@ -662,7 +726,12 @@ func (f *FS) Root() (fs.Node, error) {
 			return nil, err
 		}
 		f.log.Debug("loaded meta root", "ref", m.Hash)
-		return NewDir(f, m, nil)
+		d, err := NewDir(f, m, nil)
+		if err != nil {
+			return nil, err
+		}
+		f.mount = &Mount{immutable: f.immutable, root: d}
+		return d, nil
 	case vkv.ErrNotFound:
 		saveLocally = true
 	default:
@@ -691,7 +760,12 @@ func (f *FS) Root() (fs.Node, error) {
 			return nil, err
 		}
 		f.log.Debug("loaded meta root", "ref", m.Hash)
-		return NewDir(f, m, nil)
+		d, err := NewDir(f, m, nil)
+		if err != nil {
+			return nil, err
+		}
+		f.mount = &Mount{immutable: f.immutable, root: d}
+		return d, nil
 	case kvstore.ErrKeyNotFound:
 		root := &Dir{
 			fs:        f,
@@ -706,6 +780,7 @@ func (f *FS) Root() (fs.Node, error) {
 		}
 		f.log.Debug("Creating a new root", "ref", root.meta.Hash)
 		root.log = root.log.New("ref", root.meta.Hash)
+		f.mount = &Mount{immutable: f.immutable, root: root}
 		return root, nil
 	default:
 		return nil, err
@@ -734,31 +809,39 @@ func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 		Children2: map[string]fs.Node{},
 		log:       rfs.log.New("ref", m.Hash, "name", m.Name, "type", "dir"),
 	}
+	if err := d.reload(); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+func (d *Dir) reload() error {
+	d.log.Info("Reload")
 	for _, ref := range d.meta.Refs {
-		blob, err := rfs.bs.Get(ref.(string))
+		blob, err := d.fs.bs.Get(ref.(string))
 		if err != nil {
-			return nil, err
+			return err
 		}
 		m, err := meta.NewMetaFromBlob(ref.(string), blob)
 		if err != nil {
-			return d, err
+			return err
 		}
 		d.Children[m.Name] = m
 		if m.IsDir() {
-			ndir, err := NewDir(rfs, m, d)
+			ndir, err := NewDir(d.fs, m, d)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			d.Children2[m.Name] = ndir
 		} else {
-			nfile, err := NewFile(rfs, m, d)
+			nfile, err := NewFile(d.fs, m, d)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			d.Children2[m.Name] = nfile
 		}
 	}
-	return d, nil
+	return nil
 }
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
