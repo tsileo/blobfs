@@ -30,15 +30,11 @@ type CommitLog struct {
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-	// fmt.Fprintf(os.Stderr, "  %s NAME MOUNTPOINT\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s COMMAND\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
 func main() {
-	// hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
-	// loglevelPtr := flag.String("loglevel", "info", "logging level (debug|info|warn|crit)")
-	// immutablePtr := flag.Bool("immutable", false, "make the filesystem immutable")
-	// hostnamePtr := flag.String("hostname", "", "default to system hostname")
 	commentPtr := flag.String("comment", "", "optional commit comment")
 
 	flag.Usage = Usage
@@ -105,6 +101,9 @@ func Status(u string) error {
 	if err != nil {
 		return err
 	}
+	if resp.StatusCode == 204 {
+		return nil
+	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("http %d", resp.StatusCode)
 	}
@@ -160,7 +159,6 @@ func Log(u string) error {
 	}
 	w := new(tabwriter.Writer)
 	w.Init(os.Stdout, 0, 8, 0, '\t', 0)
-	// TODO(tsileo): add a * to the current checked out version, look how git is doing for branch
 	for _, log := range logs {
 		if log.Current {
 			fmt.Fprintf(w, "* %s\t%s\t%s\n", yellow(log.Ref), log.T, log.Comment)
@@ -190,6 +188,7 @@ func Checkout(u, ref string) error {
 	}
 	return fmt.Errorf("http %d", resp.StatusCode)
 }
+
 func Commit(u, msg string) error {
 	body, err := json.Marshal(map[string]interface{}{"comment": msg})
 	if err != nil {

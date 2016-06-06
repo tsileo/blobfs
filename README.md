@@ -39,6 +39,7 @@ newdoc
 
 ## TODOs
 
+- [ ] `.ignore` file support
 - [ ] Basic automatic conflict resolution
 - [ ] Support BlobStash namespace
 - [ ] Watch the root key for update
