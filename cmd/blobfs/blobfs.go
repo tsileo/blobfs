@@ -8,12 +8,24 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"sort"
+	"text/tabwriter"
+
+	"github.com/fatih/color"
 )
+
+var (
+	LogStaging = "STAGING"
+	LogLatest  = "LATEST"
+)
+
+var yellow = color.New(color.FgYellow).SprintFunc()
 
 type CommitLog struct {
 	T       string `json:"t"`
 	Ref     string `json:"ref"`
 	Comment string `json:"comment"`
+	Current bool   `json:"current"`
 }
 
 var Usage = func() {
@@ -48,24 +60,86 @@ func main() {
 	url := string(u)
 	switch cmd {
 	case "commit":
-		fmt.Printf("comment: %v", *commentPtr)
 		if err := Commit(url, *commentPtr); err != nil {
 			panic(err)
 		}
 	case "checkout":
-		fmt.Printf("ref: %v", flag.Arg(1))
 		if err := Checkout(url, flag.Arg(1)); err != nil {
 			panic(err)
 		}
-	case "log":
+	case "history", "log":
 		if err := Log(url); err != nil {
 			panic(err)
 		}
-	case "prune", "status":
+	case "status":
+		if err := Status(url); err != nil {
+			panic(err)
+		}
+	case "prune":
 		fmt.Printf("Not implemented yet")
 	default:
 		fmt.Printf("unknown cmd %v", cmd)
 	}
+}
+
+type StatusResp struct {
+	Added    []string `json:"added"`
+	Modified []string `json:"modified"`
+	Deleted  []string `json:"deleted"`
+}
+
+func buildStatusIndex(in []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, path := range in {
+		out[path] = struct{}{}
+	}
+	return out
+}
+
+func Status(u string) error {
+	request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/status"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	sr := &StatusResp{}
+	if err := json.NewDecoder(resp.Body).Decode(sr); err != nil {
+		return err
+	}
+	deletedIndex := buildStatusIndex(sr.Deleted)
+	modifiedIndex := buildStatusIndex(sr.Modified)
+	addedIndex := buildStatusIndex(sr.Added)
+	paths := []string{}
+	for _, p := range sr.Added {
+		paths = append(paths, p)
+	}
+	for _, p := range sr.Deleted {
+		paths = append(paths, p)
+	}
+	for _, p := range sr.Modified {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		var letter string
+		if _, ok := addedIndex[p]; ok {
+			letter = "A"
+		}
+		if _, ok := modifiedIndex[p]; ok {
+			letter = "M"
+		}
+		if _, ok := deletedIndex[p]; ok {
+			letter = "D"
+		}
+		fmt.Printf("%s  %s\n", yellow(letter), p)
+	}
+	return nil
 }
 
 func Log(u string) error {
@@ -84,10 +158,17 @@ func Log(u string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&logs); err != nil {
 		return err
 	}
+	w := new(tabwriter.Writer)
+	w.Init(os.Stdout, 0, 8, 0, '\t', 0)
 	// TODO(tsileo): add a * to the current checked out version, look how git is doing for branch
 	for _, log := range logs {
-		fmt.Printf("%s  %v\t%s\n", log.T, log.Ref, log.Comment)
+		if log.Current {
+			fmt.Fprintf(w, "* %s\t%s\t%s\n", yellow(log.Ref), log.T, log.Comment)
+		} else {
+			fmt.Fprintf(w, "  %s\t%s\t%s\n", log.Ref, log.T, log.Comment)
+		}
 	}
+	w.Flush()
 	return nil
 }
 
@@ -104,7 +185,7 @@ func Checkout(u, ref string) error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode == 204 {
+	if resp.StatusCode == 200 {
 		return nil
 	}
 	return fmt.Errorf("http %d", resp.StatusCode)

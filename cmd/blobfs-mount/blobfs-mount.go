@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"syscall"
@@ -89,6 +90,7 @@ func (api *API) Serve() error {
 	http.HandleFunc("/", apiIndexHandler)
 	http.HandleFunc("/stats", apiStatsHandler)
 	http.HandleFunc("/checkout", apiCheckoutHandler)
+	http.HandleFunc("/status", apiStatusHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
 	http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
@@ -97,9 +99,11 @@ func (api *API) Serve() error {
 
 func apiIndexHandler(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, map[string]interface{}{
-		"stats":  bfs.host + "/stats",
-		"sync":   bfs.host + "/sync",
-		"public": bfs.host + "/public",
+		"stats":    bfs.host + "/stats",
+		"sync":     bfs.host + "/sync",
+		"public":   bfs.host + "/public",
+		"checkout": bfs.host + "/checkout",
+		"log":      bfs.host + "/log",
 	})
 }
 
@@ -110,6 +114,97 @@ func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
 	stats.Lock()
 	defer stats.Unlock()
 	WriteJSON(w, stats)
+}
+
+type NodeStatus struct {
+	Type string
+	Path string
+	Ref  string
+}
+
+func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
+	root := []*NodeStatus{}
+	index := map[string]*NodeStatus{}
+	if err := iterDir(d, func(node fs.Node) error {
+		switch n := node.(type) {
+		case *File:
+			path := ""
+			if n.parent.Name != "_root" {
+				p1 := n.parent
+				for p1.parent != nil {
+					path = filepath.Join(path, p1.Name)
+					p1 = p1.parent
+				}
+			}
+			p := filepath.Join(path, n.Meta.Name)
+			nd := &NodeStatus{Type: "file", Path: p, Ref: n.Meta.Hash}
+			root = append(root, nd)
+			index[p] = nd
+		case *Dir:
+			path := ""
+			if n.Name == "_root" {
+				return nil
+			}
+			if n.parent != nil {
+				p1 := n.parent
+				for p1.parent != nil {
+					path = filepath.Join(path, p1.Name)
+					p1 = p1.parent
+				}
+			}
+			p := filepath.Join(path, n.Name) + "/"
+			nd := &NodeStatus{Type: "dir", Path: p, Ref: n.meta.Hash}
+			root = append(root, nd)
+			index[p] = nd
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	return root, index
+}
+
+func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if bfs.mount.ref != bfs.staging.ref {
+		// No changes, returns a 204
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if bfs.mount.ref != bfs.staging.ref {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	added := []string{}
+	deleted := []string{}
+	modified := []string{}
+	_, latestIndex := DirToStatus(bfs.latest.root.(*Dir))
+	_, stagingIndex := DirToStatus(bfs.staging.root.(*Dir))
+
+	// XXX(tsileo): what abour **R**enamed
+
+	for path, ns := range stagingIndex {
+		if lns, ok := latestIndex[path]; ok {
+			if ns.Ref != lns.Ref {
+				modified = append(modified, ns.Path)
+			}
+		} else {
+			added = append(added, ns.Path)
+		}
+	}
+	for path, ns := range latestIndex {
+		if _, ok := stagingIndex[path]; !ok {
+			deleted = append(deleted, ns.Path)
+		}
+	}
+
+	WriteJSON(w, map[string]interface{}{
+		"ref":      bfs.mount.ref,
+		"added":    added,
+		"modified": modified,
+		"deleted":  deleted,
+		// "latest":   latest,
+		// "staging":  staging,
+	})
 }
 
 type CheckoutReq struct {
@@ -127,12 +222,20 @@ func apiCheckoutHandler(w http.ResponseWriter, r *http.Request) {
 			panic(err)
 		}
 	}
-	fmt.Printf("%+v", cr)
+	switch cr.Ref {
+	case "LATEST":
+		cr.Ref = bfs.latest.ref
+	case "STAGING":
+		if bfs.staging == nil {
+			cr.Ref = bfs.latest.ref
+		}
+		cr.Ref = bfs.staging.ref
+	}
 	// FIXME(tsileo): Check if cr.Ref == lastRef, and if so make it mutable
 	if err := bfs.setRoot(cr.Ref, true); err != nil {
 		panic(err)
 	}
-	w.WriteHeader(http.StatusNoContent)
+	WriteJSON(w, cr)
 }
 
 type SyncReq struct {
@@ -188,6 +291,7 @@ type CommitLog struct {
 	T       string `json:"t"`
 	Ref     string `json:"ref"`
 	Comment string `json:"comment"`
+	Current bool   `json:"current"`
 }
 
 func apiLogHandler(w http.ResponseWriter, r *http.Request) {
@@ -200,16 +304,34 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 	out := []*CommitLog{}
+	if bfs.staging != nil && bfs.staging.ref != bfs.latest.ref {
+		cl := &CommitLog{
+			Ref:     "STAGING",
+			Comment: "",
+			T:       "",
+		}
+		if bfs.mount.ref == bfs.staging.ref {
+			cl.Current = true
+		}
+		out = append(out, cl)
+	}
 	for _, v := range versions.Versions {
 		croot := &root.Root{}
 		if err := json.Unmarshal([]byte(v.Value), croot); err != nil {
 			panic(err)
 		}
-		out = append(out, &CommitLog{
+		cl := &CommitLog{
 			T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
 			Ref:     croot.Ref,
 			Comment: croot.Comment,
-		})
+		}
+		// if cl.Ref == bfs.latest.ref {
+		// 	cl.Ref = "LATEST"
+		// }
+		if bfs.mount.ref == cl.Ref {
+			cl.Current = true
+		}
+		out = append(out, cl)
 	}
 	WriteJSON(w, out)
 }
@@ -371,10 +493,10 @@ func main() {
 
 	c, err := fuse.Mount(
 		mountpoint,
-		fuse.FSName("blobfs"),
+		fuse.FSName(name),
 		fuse.Subtype("blobfs"),
-		fuse.LocalVolume(),
-		fuse.VolumeName("BlobFS"),
+		// fuse.LocalVolume(),
+		fuse.VolumeName(name),
 	)
 	defer c.Close()
 	if err != nil {
@@ -409,8 +531,6 @@ func main() {
 	}
 
 	go func() {
-		// TODO(tsileo): make the time configurable
-		t := time.NewTicker(60 * time.Second)
 		for {
 			sync := func(sr *SyncReq) {
 				wg.Add(1)
@@ -532,11 +652,12 @@ func main() {
 					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 					return
 				}
+				if bfs.latest == nil {
+					bfs.latest = &Mount{}
+				}
+				bfs.latest.ref = newRoot.Ref
 			}
 			select {
-			case <-t.C:
-				fslog.Info("Periodic sync")
-				// sync()
 			case sr := <-bfs.sync:
 				fslog.Info("Sync triggered")
 				sync(sr)
@@ -643,13 +764,16 @@ type FS struct {
 	lastRootVersion int
 	sync            chan *SyncReq
 	lastWrite       time.Time
-	mount           *Mount
 	root            fs.Node
+	mount           *Mount
+	staging         *Mount
+	latest          *Mount
 }
 
 type Mount struct {
 	immutable bool
 	root      fs.Node
+	ref       string
 }
 
 // newBewit returns a `bewit` token valid for the given delay
@@ -666,6 +790,7 @@ type Mount struct {
 // }
 
 func (f *FS) Immutable() bool {
+	// TODO(tsileo): check the mount
 	return f.immutable
 }
 
@@ -701,7 +826,7 @@ func (f *FS) setRoot(ref string, immutable bool) error {
 	if err != nil {
 		return err
 	}
-	f.mount = &Mount{immutable: immutable, root: d}
+	f.mount = &Mount{immutable: immutable, root: d, ref: ref}
 	*f.root.(*Dir) = *d
 	// f.root.(*Dir).log = f.root.(*Dir).log.New("ref", d.meta.Hash)
 	// XXX(tsileo): keep the real root meta somewhere to get back to HEAD
@@ -730,8 +855,9 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		f.mount = &Mount{immutable: f.immutable, root: d}
-		return d, nil
+		f.mount = &Mount{immutable: f.immutable, root: d, ref: m.Hash}
+		f.staging = f.mount
+		// return d, nil
 	case vkv.ErrNotFound:
 		saveLocally = true
 	default:
@@ -764,8 +890,12 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		f.mount = &Mount{immutable: f.immutable, root: d}
-		return d, nil
+		cmount := &Mount{immutable: f.immutable, root: d, ref: m.Hash}
+		if f.staging == nil {
+			f.mount = cmount
+		}
+		f.latest = cmount
+		// return d, nil
 	case kvstore.ErrKeyNotFound:
 		root := &Dir{
 			fs:        f,
@@ -780,11 +910,16 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		}
 		f.log.Debug("Creating a new root", "ref", root.meta.Hash)
 		root.log = root.log.New("ref", root.meta.Hash)
-		f.mount = &Mount{immutable: f.immutable, root: root}
-		return root, nil
+		f.mount = &Mount{immutable: f.immutable, root: root, ref: root.meta.Hash}
+		f.latest = f.mount
 	default:
 		return nil, err
 	}
+	f.log.Info("initial load", "mount", f.mount, "latest", f.latest, "staging", f.staging)
+	if f.staging != nil {
+		return f.staging.root, nil
+	}
+	return f.latest.root, nil
 }
 
 // Dir implements both Node and Handle for the root directory.
@@ -1099,6 +1234,10 @@ func (d *Dir) save(sync bool) error {
 		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
 			return err
 		}
+		if d.fs.staging == nil {
+			d.fs.staging = &Mount{}
+		}
+		d.fs.staging.ref = mhash
 	}
 	if d.parent != nil {
 		d.parent.mu.Lock()
