@@ -88,6 +88,7 @@ type API struct {
 
 func (api *API) Serve() error {
 	http.HandleFunc("/", apiIndexHandler)
+	http.HandleFunc("/ref", apiRefHandler)
 	http.HandleFunc("/stats", apiStatsHandler)
 	http.HandleFunc("/checkout", apiCheckoutHandler)
 	http.HandleFunc("/status", apiStatusHandler)
@@ -162,6 +163,18 @@ func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
 		panic(err)
 	}
 	return root, index
+}
+
+func apiRefHandler(w http.ResponseWriter, r *http.Request) {
+	var ref string
+	if bfs.mount.ref == bfs.staging.ref {
+		ref = "STAGING"
+	} else if bfs.mount.ref == bfs.latest.ref {
+		ref = "LATEST"
+	} else {
+		ref = bfs.mount.ref[:10]
+	}
+	WriteJSON(w, map[string]string{"ref": ref})
 }
 
 func apiStatusHandler(w http.ResponseWriter, r *http.Request) {

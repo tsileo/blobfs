@@ -20,7 +20,11 @@ var (
 	LogLatest  = "LATEST"
 )
 
-var yellow = color.New(color.FgYellow).SprintFunc()
+var (
+	yellow     = color.New(color.FgYellow).SprintFunc()
+	yellowBold = color.New(color.FgYellow, color.Bold).SprintFunc()
+	bold       = color.New(color.Bold).SprintFunc()
+)
 
 type CommitLog struct {
 	T       string `json:"t"`
@@ -52,6 +56,7 @@ func isPublic(path string) (bool, error) {
 func main() {
 	commentPtr := flag.String("comment", "", "optional commit comment")
 	publicPtr := flag.Bool("public", false, "share the node publicly (default to semi-private)")
+	// shareTTLPtr := flag.String("share-ttl", "1h", "TTL for the semi-private sharing linl (default to 1h)")
 
 	flag.Usage = Usage
 	flag.Parse()
@@ -61,11 +66,31 @@ func main() {
 		os.Exit(2)
 	}
 	cmd := flag.Arg(0)
-	// p, err := os.Getwd()
-	// if err != nil {
-	// 	panic(err)
-	// }
 	u, err := ioutil.ReadFile(".blobfs_url")
+	// TODO(tsileo): do the same for bash
+	if cmd == "__ps1_zsh" {
+		if os.IsNotExist(err) {
+			fmt.Printf("")
+			return
+		}
+		request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/ref"), nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return
+		}
+		if resp.StatusCode != 200 {
+			return
+		}
+		rr := &RefResp{}
+		if err := json.NewDecoder(resp.Body).Decode(rr); err != nil {
+			return
+		}
+		fmt.Print("%Bblobfs%b:(%{\033[33m%}" + rr.Ref + "%{\033[0m%}) ")
+		return
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -98,6 +123,7 @@ func main() {
 		}
 		fmt.Printf("public:%s\n", public)
 
+		// Share in "public" mode
 		if *publicPtr {
 
 			if public {
@@ -116,14 +142,36 @@ func main() {
 				}
 				fmt.Printf("%s\n", burl)
 			}
-			fmt.Printf("You still need to commit for the file to be available.")
+			fmt.Printf("You still need to commit for the file to become available.")
 			return
 
 		}
 
+		// Share in semi-private mode (e.g. anyone with the link can access it)
 		// XXX(tsileo): call the API to get a bewit signed link
 
-	case "prune", "unshare", "public": // XXX(tsileo): find a better name than `public` for listing public nodes
+	case "unshare":
+		path := "."
+		if flag.NArg() == 2 {
+			path = flag.Arg(1)
+		}
+		public, err := isPublic(path)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("public:%s\n", public)
+		if !public {
+			// XXX(tsileo): color in red?
+			fmt.Printf("You can only unshare public nodes")
+			// TODO(tsileo): return with error code
+			return
+		}
+
+		if err := xattr.Set(path, "public", []byte("0")); err != nil {
+			panic(err)
+		}
+		fmt.Printf("You still need to commit for the file to become unavailable.")
+	case "prune", "public": // XXX(tsileo): find a better name than `public` for listing public nodes
 		fmt.Printf("Not implemented yet")
 	default:
 		fmt.Printf("unknown cmd %v", cmd)
@@ -134,6 +182,10 @@ type StatusResp struct {
 	Added    []string `json:"added"`
 	Modified []string `json:"modified"`
 	Deleted  []string `json:"deleted"`
+}
+
+type RefResp struct {
+	Ref string `json:"ref"`
 }
 
 func buildStatusIndex(in []string) map[string]struct{} {
