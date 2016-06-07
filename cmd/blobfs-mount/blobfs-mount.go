@@ -985,10 +985,38 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
+func makePublic(n fs.Node) error {
+	switch node := n.(type) {
+	case *Dir:
+		node.meta.XAttrs["public"] = "1"
+		if err := node.save(false); err != nil {
+			return err
+		}
+		for _, child := range node.Children2 {
+			if err := makePublic(child); err != nil {
+				return err
+			}
+		}
+	case *File:
+		node.Meta.XAttrs["public"] = "1"
+		if err := node.save(); err != nil {
+			return err
+		}
+	default:
+		panic("shouldn't happen")
+	}
+	return nil
+}
+
 func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	d.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// If the request is to make the dir public, make it recursively
+	if req.Name == "public" {
+		return makePublic(d)
+	}
 
 	// Prevent writing attributes name that are virtual attributes
 	if _, exists := virtualXAttrs[req.Name]; exists {
@@ -1002,6 +1030,7 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if err := d.save(false); err != nil {
 		return err
 	}
+
 	// // Trigger a sync so the file will be (un)available for BlobStash right now
 	// if req.Name == "public" {
 	// 	bfs.sync <- struct{}{}
@@ -1263,6 +1292,13 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	m.Name = req.Name
 	m.Mode = uint32(req.Mode)
 	m.ModTime = time.Now().Format(time.RFC3339)
+
+	// If the parent directory is public, the new file should to
+	if d.meta.IsPublic() {
+		m.XAttrs = map[string]string{"public": "1"}
+	}
+
+	// Save the meta
 	mhash, mjs := m.Json()
 	m.Hash = mhash
 	mexists, err := d.fs.bs.Stat(mhash)
