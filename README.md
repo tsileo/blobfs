@@ -7,6 +7,7 @@ A FUSE file system built on top of [BlobStash](https://github.com/tsileo/blobsta
  - Content addressed (with BLAKE2b as hashing algorithm), files are split into blobs, and retrieved by hash, blobs are deduplicated (incremental backups by default).
  - You choose when to **commit** changes, with basic CVS features.
  - **checkout** old versions as immutable snapshot
+ - Easily share entire directories or single files through BlobStash
 
 ## Usage
 

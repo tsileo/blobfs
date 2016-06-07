@@ -985,20 +985,28 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-func makePublic(n fs.Node) error {
+func makePublic(n fs.Node, value string) error {
 	switch node := n.(type) {
 	case *Dir:
-		node.meta.XAttrs["public"] = "1"
+		if value == "1" {
+			node.meta.XAttrs["public"] = value
+		} else {
+			delete(node.meta.XAttrs, "public")
+		}
 		if err := node.save(false); err != nil {
 			return err
 		}
 		for _, child := range node.Children2 {
-			if err := makePublic(child); err != nil {
+			if err := makePublic(child, value); err != nil {
 				return err
 			}
 		}
 	case *File:
-		node.Meta.XAttrs["public"] = "1"
+		if value == "1" {
+			node.Meta.XAttrs["public"] = value
+		} else {
+			delete(node.Meta.XAttrs, "public")
+		}
 		if err := node.save(); err != nil {
 			return err
 		}
@@ -1015,7 +1023,7 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 
 	// If the request is to make the dir public, make it recursively
 	if req.Name == "public" {
-		return makePublic(d)
+		return makePublic(d, string(req.Xattr))
 	}
 
 	// Prevent writing attributes name that are virtual attributes

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"text/tabwriter"
 
+	"github.com/AlekSi/xattr"
 	"github.com/fatih/color"
 )
 
@@ -34,8 +35,23 @@ var Usage = func() {
 	flag.PrintDefaults()
 }
 
+func isPublic(path string) (bool, error) {
+	res, err := xattr.Get(path, "public")
+	if err != nil {
+		if !xattr.IsNotExist(err) {
+			return false, err
+		}
+	} else {
+		if string(res) == "1" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func main() {
 	commentPtr := flag.String("comment", "", "optional commit comment")
+	publicPtr := flag.Bool("public", false, "share the node publicly (default to semi-private)")
 
 	flag.Usage = Usage
 	flag.Parse()
@@ -71,7 +87,43 @@ func main() {
 		if err := Status(url); err != nil {
 			panic(err)
 		}
-	case "prune":
+	case "share":
+		path := "."
+		if flag.NArg() == 2 {
+			path = flag.Arg(1)
+		}
+		public, err := isPublic(path)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("public:%s\n", public)
+
+		if *publicPtr {
+
+			if public {
+				burl, err := xattr.Get(path, "url")
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf("%s\n", burl)
+			} else {
+				if err := xattr.Set(path, "public", []byte("1")); err != nil {
+					panic(err)
+				}
+				burl, err := xattr.Get(path, "url")
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf("%s\n", burl)
+			}
+			fmt.Printf("You still need to commit for the file to be available.")
+			return
+
+		}
+
+		// XXX(tsileo): call the API to get a bewit signed link
+
+	case "prune", "unshare", "public": // XXX(tsileo): find a better name than `public` for listing public nodes
 		fmt.Printf("Not implemented yet")
 	default:
 		fmt.Printf("unknown cmd %v", cmd)
