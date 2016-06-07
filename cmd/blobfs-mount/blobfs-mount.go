@@ -167,10 +167,10 @@ func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
 
 func apiRefHandler(w http.ResponseWriter, r *http.Request) {
 	var ref string
-	if bfs.mount.ref == bfs.staging.ref {
-		ref = "STAGING"
-	} else if bfs.mount.ref == bfs.latest.ref {
+	if bfs.mount.ref == bfs.latest.ref {
 		ref = "LATEST"
+	} else if bfs.mount.ref == bfs.staging.ref {
+		ref = "STAGING"
 	} else {
 		ref = bfs.mount.ref[:10]
 	}
