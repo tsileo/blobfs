@@ -68,11 +68,35 @@ func main() {
 	cmd := flag.Arg(0)
 	u, err := ioutil.ReadFile(".blobfs_url")
 	// TODO(tsileo): do the same for bash
+	if cmd == "__ps1_bash" {
+		if os.IsNotExist(err) {
+			fmt.Printf("")
+			return
+		}
+		request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/ref"), nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return
+		}
+		if resp.StatusCode != 200 {
+			return
+		}
+		rr := &RefResp{}
+		if err := json.NewDecoder(resp.Body).Decode(rr); err != nil {
+			return
+		}
+		fmt.Printf("%s:(%s) ", bold("blobfs"), yellow(rr.Ref))
+		return
+	}
 	if cmd == "__ps1_zsh" {
 		if os.IsNotExist(err) {
 			fmt.Printf("")
 			return
 		}
+		// TODO(tsileo): a getRef
 		request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/ref"), nil)
 		if err != nil {
 			return
