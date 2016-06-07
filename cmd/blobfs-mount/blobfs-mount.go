@@ -35,14 +35,11 @@ import (
 
 // XXX(tsileo): consider rewriting the init using the filetree API
 // FIXME(tsileo): remove Dir.Children and rename Children2 to Children
-// TODO(tsileo): embed an HTTP server to:
-// - cache all the FS' blobs locally
-// - clean the cache
-// + a cli tool like `blobfs volume home sync` and in the future even sharing
-// TODO(tsileo): react on remote changes by:
-// - polling?
-// - SSE (e.g. the VKV watch endpoint)
-// TODO(tsileo): find a secure way to provide semi-private (Bewit signed) link
+
+// TODO(tsileo): an interface that compose with fs.Node, but with Meta() *meta.Meta
+// TODO(tsileo): a way to tweak the cache (add a LRU?), e.g. keep the staging only,
+// always the latest version + staging.
+// TODO(tsileo): poll with a backoff retry the latest vkv key, except when in staging?
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -61,8 +58,6 @@ var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 
 var wg sync.WaitGroup
 var bfs *FS
-
-// XXX(tsileo): move this from blobfs to blobfs-mount
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -395,6 +390,20 @@ func iterDir(dir *Dir, cb func(n fs.Node) error) error {
 	return cb(dir)
 }
 
+func getLatestRemoteRoot() (*root.Root, error) {
+	rkv, err := bfs.kvs.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+	if err != nil {
+		return nil, err
+	}
+	// FIXME(tsileo): a way to output the sync status to the HTTP handler
+	// like: "already in sync"/"synced"/"conflict"
+	rroot := &root.Root{}
+	if err := json.Unmarshal([]byte(rkv.Value), rroot); err != nil {
+		return nil, err
+	}
+	return rroot, nil
+}
+
 // Borrowed from https://github.com/ipfs/go-ipfs/blob/master/fuse/mount/mount.go
 func unmount(mountpoint string) error {
 	var cmd *exec.Cmd
@@ -489,21 +498,6 @@ func main() {
 	kvsOpts.SnappyCompression = false
 	kvs := kvstore.New(kvsOpts)
 
-	// Fetch the Hawk key for creating sharing URL (using Bewit)
-	// hawkResp, err := bs.Client().DoReq("GET", "/api/v1/perms/hawk", nil, nil)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// if hawkResp.StatusCode != 200 {
-	// 	panic("failed to fetch Hawk key")
-	// }
-	// k := struct {
-	// 	Key string `json:"key"`
-	// }{}
-	// if err := json.NewDecoder(hawkResp.Body).Decode(&k); err != nil {
-	// 	panic(err)
-	// }
-
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName(name),
@@ -516,22 +510,6 @@ func main() {
 		fslog.Crit("failed to mount", "err", err)
 		os.Exit(1)
 	}
-	// FIXME(tsileo): handle shutdown
-	// go func() {
-	// 	cs := make(chan os.Signal, 1)
-	// 	signal.Notify(cs, os.Interrupt,
-	// 		syscall.SIGHUP,
-	// 		syscall.SIGINT,
-	// 		syscall.SIGTERM,
-	// 		syscall.SIGQUIT)
-	// 	<-cs
-	// 	// c.Close()
-	// 	fslog.Info("Unmounting...")
-	// 	// bfs.bs.Close()
-	// 	c.Close()
-	// 	fuse.Unmount(mountpoint)
-	// 	os.Exit(0)
-	// }()
 	bfs = &FS{
 		log:       fslog,
 		name:      name,
@@ -550,6 +528,20 @@ func main() {
 				defer wg.Done()
 				l := fslog.New("module", "sync")
 				l.Debug("Sync triggered")
+
+				// XXX(tsileo): a getRoot to DRY?
+				rroot, err := getLatestRemoteRoot()
+				if err != nil {
+					l.Error("failed to fetch latest remote vkv entry", "err", err)
+					return
+				}
+				// FIXME(tsileo): a way to output the sync status to the HTTP handler
+				// like: "already in sync"/"synced"/"conflict"
+				if rroot.Ref != bfs.latest.ref {
+					l.Error("conflicted tree")
+					// FIXME(tsileo): return a conflicted status
+					return
+				}
 
 				// Keep some basic stats about the on-going sync
 				stats := &SyncStats{}
@@ -788,19 +780,6 @@ type Mount struct {
 	root      fs.Node
 	ref       string
 }
-
-// newBewit returns a `bewit` token valid for the given delay
-// func (fs *FS) newBewit(url string, delay time.Duration) (string, error) {
-// 	auth, err := hawk.NewURLAuth(url, &hawk.Credentials{
-// 		ID:   appID,
-// 		Key:  fs.hawkKey,
-// 		Hash: sha256.New,
-// 	}, delay)
-// 	if err != nil {
-// 		return "", err
-// 	}
-// 	return auth.Bewit(), nil
-// }
 
 func (f *FS) Immutable() bool {
 	// TODO(tsileo): check the mount
