@@ -2,12 +2,15 @@ package cache
 
 import (
 	"path/filepath"
+	"sync"
+
+	"golang.org/x/net/context"
 
 	"github.com/tsileo/blobstash/pkg/backend/blobsfile"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/clientutil"
 	"github.com/tsileo/blobstash/pkg/config/pathutil"
-	"github.com/tsileo/blobstash/vkv"
+	"github.com/tsileo/blobstash/pkg/vkv"
 )
 
 // TODO(tsileo): add Clean/Reset/Remove methods
@@ -16,12 +19,13 @@ type Cache struct {
 	backend *blobsfile.BlobsFileBackend
 	bs      *blobstore.BlobStore
 	kv      *vkv.DB
+	wg      sync.WaitGroup
 	// TODO(tsileo): embed a kvstore too (but witouth sync/), may be make it optional?
 }
 
 func New(opts *clientutil.Opts, name string) *Cache {
-	backend := blobsfile.New(filepath.Join(pathutil.VarDir(), name), 0, false, false)
-
+	wg := sync.WaitGroup{}
+	backend := blobsfile.New(filepath.Join(pathutil.VarDir(), name), 0, false, wg)
 	kv, err := vkv.New(filepath.Join(pathutil.VarDir(), name, "vkv"))
 	if err != nil {
 		panic(err)
@@ -30,6 +34,7 @@ func New(opts *clientutil.Opts, name string) *Cache {
 		kv:      kv,
 		bs:      blobstore.New(opts),
 		backend: backend,
+		wg:      wg,
 	}
 }
 
@@ -69,12 +74,12 @@ func (c *Cache) Stat(hash string) (bool, error) {
 	return exists, err
 }
 
-func (c *Cache) Get(hash string) ([]byte, error) {
+func (c *Cache) Get(ctx context.Context, hash string) ([]byte, error) {
 	blob, err := c.backend.Get(hash)
 	switch err {
 	// If the blob is not found locally, try to fetch it from the remote blobstore
 	case clientutil.ErrBlobNotFound:
-		blob, err = c.bs.Get(hash)
+		blob, err = c.bs.Get(ctx, hash)
 		if err != nil {
 			return nil, err
 		}

@@ -10,9 +10,11 @@ import (
 	"os"
 	"sort"
 	"text/tabwriter"
+	"time"
 
 	"github.com/AlekSi/xattr"
 	"github.com/fatih/color"
+	"github.com/tv42/httpunix"
 )
 
 var (
@@ -66,8 +68,20 @@ func main() {
 		os.Exit(2)
 	}
 	cmd := flag.Arg(0)
-	u, err := ioutil.ReadFile(".blobfs_url")
+	rsocket, err := ioutil.ReadFile(".blobfs_socket")
 	// TODO(tsileo): do the same for bash
+
+	transport := &httpunix.Transport{
+		DialTimeout:           100 * time.Millisecond,
+		RequestTimeout:        1 * time.Second,
+		ResponseHeaderTimeout: 1 * time.Second,
+	}
+	transport.RegisterLocation("blobfs", string(rsocket))
+
+	var client = http.Client{
+		Transport: transport,
+	}
+	u := "http+unix://blobfs"
 	if cmd == "__ps1_bash" {
 		if os.IsNotExist(err) {
 			fmt.Printf("")
@@ -77,7 +91,7 @@ func main() {
 		if err != nil {
 			return
 		}
-		resp, err := http.DefaultClient.Do(request)
+		resp, err := client.Do(request)
 		if err != nil {
 			return
 		}
@@ -101,7 +115,7 @@ func main() {
 		if err != nil {
 			return
 		}
-		resp, err := http.DefaultClient.Do(request)
+		resp, err := client.Do(request)
 		if err != nil {
 			return
 		}
@@ -121,19 +135,19 @@ func main() {
 	url := string(u)
 	switch cmd {
 	case "commit":
-		if err := Commit(url, *commentPtr); err != nil {
+		if err := Commit(client, url, *commentPtr); err != nil {
 			panic(err)
 		}
 	case "checkout":
-		if err := Checkout(url, flag.Arg(1)); err != nil {
+		if err := Checkout(client, url, flag.Arg(1)); err != nil {
 			panic(err)
 		}
 	case "history", "log":
-		if err := Log(url); err != nil {
+		if err := Log(client, url); err != nil {
 			panic(err)
 		}
 	case "status":
-		if err := Status(url); err != nil {
+		if err := Status(client, url); err != nil {
 			panic(err)
 		}
 	case "share":
@@ -166,13 +180,21 @@ func main() {
 				}
 				fmt.Printf("%s\n", burl)
 			}
-			fmt.Printf("You still need to commit for the file to become available.")
+			fmt.Printf("\nYou still need to commit for the file to become available.")
 			return
 
 		}
 
+		// TODO(tsileo): display a special message if a semi-privat link is requested
+		// for a node in staging only.
+
 		// Share in semi-private mode (e.g. anyone with the link can access it)
-		// XXX(tsileo): call the API to get a bewit signed link
+		burl, err := xattr.Get(path, "url.semiprivate")
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("%s\n", burl)
+		fmt.Printf("\nYou still need to commit for the file to become available.")
 
 	case "unshare":
 		path := "."
@@ -194,7 +216,7 @@ func main() {
 		if err := xattr.Set(path, "public", []byte("0")); err != nil {
 			panic(err)
 		}
-		fmt.Printf("You still need to commit for the file to become unavailable.")
+		fmt.Printf("\nYou still need to commit for the file to become unavailable.")
 	case "prune", "public": // XXX(tsileo): find a better name than `public` for listing public nodes
 		fmt.Printf("Not implemented yet")
 	default:
@@ -220,12 +242,12 @@ func buildStatusIndex(in []string) map[string]struct{} {
 	return out
 }
 
-func Status(u string) error {
+func Status(client http.Client, u string) error {
 	request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/status"), nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(request)
+	resp, err := client.Do(request)
 	if err != nil {
 		return err
 	}
@@ -269,12 +291,12 @@ func Status(u string) error {
 	return nil
 }
 
-func Log(u string) error {
+func Log(client http.Client, u string) error {
 	request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/log"), nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(request)
+	resp, err := client.Do(request)
 	if err != nil {
 		return err
 	}
@@ -298,7 +320,7 @@ func Log(u string) error {
 	return nil
 }
 
-func Checkout(u, ref string) error {
+func Checkout(client http.Client, u, ref string) error {
 	body, err := json.Marshal(map[string]interface{}{"ref": ref})
 	if err != nil {
 		return err
@@ -307,7 +329,7 @@ func Checkout(u, ref string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(request)
+	resp, err := client.Do(request)
 	if err != nil {
 		return err
 	}
@@ -317,7 +339,7 @@ func Checkout(u, ref string) error {
 	return fmt.Errorf("http %d", resp.StatusCode)
 }
 
-func Commit(u, msg string) error {
+func Commit(client http.Client, u, msg string) error {
 	body, err := json.Marshal(map[string]interface{}{"comment": msg})
 	if err != nil {
 		return err
@@ -326,7 +348,7 @@ func Commit(u, msg string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(request)
+	resp, err := client.Do(request)
 	if err != nil {
 		return err
 	}

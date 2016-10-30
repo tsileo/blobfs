@@ -7,8 +7,8 @@ import (
 	"fmt"
 	_ "io"
 	"io/ioutil"
+	"net"
 	"net/http"
-	_ "net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,23 +23,15 @@ import (
 	"bazil.org/fuse/fuseutil"
 	"github.com/tsileo/blobfs/pkg/cache"
 	"github.com/tsileo/blobfs/pkg/root"
-	"github.com/tsileo/blobstash/ext/filetree/filetreeutil/meta"
-	"github.com/tsileo/blobstash/ext/filetree/reader/filereader"
-	"github.com/tsileo/blobstash/ext/filetree/writer"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/kvstore"
-	"github.com/tsileo/blobstash/vkv"
+	"github.com/tsileo/blobstash/pkg/filetree/filetreeutil/meta"
+	"github.com/tsileo/blobstash/pkg/filetree/reader/filereader"
+	"github.com/tsileo/blobstash/pkg/filetree/writer"
+	"github.com/tsileo/blobstash/pkg/vkv"
 	"golang.org/x/net/context"
 	"gopkg.in/inconshreveable/log15.v2"
 )
-
-// XXX(tsileo): consider rewriting the init using the filetree API
-// FIXME(tsileo): remove Dir.Children and rename Children2 to Children
-
-// TODO(tsileo): an interface that compose with fs.Node, but with Meta() *meta.Meta
-// TODO(tsileo): a way to tweak the cache (add a LRU?), e.g. keep the staging only,
-// always the latest version + staging.
-// TODO(tsileo): poll with a backoff retry the latest vkv key, except when in staging?
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -81,7 +73,7 @@ func WriteJSON(w http.ResponseWriter, data interface{}) {
 type API struct {
 }
 
-func (api *API) Serve() error {
+func (api *API) Serve(socketPath string) error {
 	http.HandleFunc("/", apiIndexHandler)
 	http.HandleFunc("/ref", apiRefHandler)
 	http.HandleFunc("/stats", apiStatsHandler)
@@ -90,7 +82,16 @@ func (api *API) Serve() error {
 	http.HandleFunc("/sync", apiSyncHandler)
 	http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
-	return http.ListenAndServe("localhost:8049", nil)
+	l, err := net.Listen("unix", socketPath)
+	if err != nil {
+		panic(err)
+	}
+	defer l.Close()
+
+	if err := http.Serve(l, nil); err != nil {
+		panic(err)
+	}
+	return nil
 }
 
 func apiIndexHandler(w http.ResponseWriter, r *http.Request) {
@@ -161,6 +162,7 @@ func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
 }
 
 func apiRefHandler(w http.ResponseWriter, r *http.Request) {
+	// TODO(tsileo): turn this into a HEAD request, and return the Ref as a header
 	var ref string
 	if bfs.mount.ref == bfs.latest.ref {
 		ref = "LATEST"
@@ -178,7 +180,7 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if bfs.mount.ref != bfs.staging.ref {
+	if bfs.mount.ref != bfs.staging.ref || bfs.staging.root == nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -307,12 +309,8 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	versions, err := bfs.kvs.Versions(fmt.Sprintf(rootKeyFmt, bfs.name), 0, -1, 0)
-	if err != nil {
-		panic(err)
-	}
 	out := []*CommitLog{}
-	if bfs.staging != nil && bfs.staging.ref != bfs.latest.ref {
+	if !bfs.staging.Empty() && bfs.staging.ref != bfs.latest.ref {
 		cl := &CommitLog{
 			Ref:     "STAGING",
 			Comment: "",
@@ -323,23 +321,31 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, cl)
 	}
-	for _, v := range versions.Versions {
-		croot := &root.Root{}
-		if err := json.Unmarshal([]byte(v.Value), croot); err != nil {
-			panic(err)
+
+	versions, err := bfs.kvs.Versions(fmt.Sprintf(rootKeyFmt, bfs.name), 0, -1, 0)
+	switch err {
+	case kvstore.ErrKeyNotFound:
+	case nil:
+		for _, v := range versions.Versions {
+			croot := &root.Root{}
+			if err := json.Unmarshal(v.Data, croot); err != nil {
+				panic(err)
+			}
+			cl := &CommitLog{
+				T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
+				Ref:     croot.Ref,
+				Comment: croot.Comment,
+			}
+			if cl.Ref == bfs.latest.ref {
+				cl.Ref = "LATEST"
+			}
+			if bfs.mount.ref == cl.Ref {
+				cl.Current = true
+			}
+			out = append(out, cl)
 		}
-		cl := &CommitLog{
-			T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
-			Ref:     croot.Ref,
-			Comment: croot.Comment,
-		}
-		// if cl.Ref == bfs.latest.ref {
-		// 	cl.Ref = "LATEST"
-		// }
-		if bfs.mount.ref == cl.Ref {
-			cl.Current = true
-		}
-		out = append(out, cl)
+	default:
+		panic(err)
 	}
 	WriteJSON(w, out)
 }
@@ -361,7 +367,7 @@ func apiCacheHandler(w http.ResponseWriter, r *http.Request) {
 			for _, m := range n.Meta.Refs {
 				data := m.([]interface{})
 				hash := data[1].(string)
-				if _, err := bfs.bs.Get(hash); err != nil {
+				if _, err := bfs.bs.Get(context.TODO(), hash); err != nil {
 					return err
 				}
 			}
@@ -395,13 +401,7 @@ func getLatestRemoteRoot() (*root.Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	// FIXME(tsileo): a way to output the sync status to the HTTP handler
-	// like: "already in sync"/"synced"/"conflict"
-	rroot := &root.Root{}
-	if err := json.Unmarshal([]byte(rkv.Value), rroot); err != nil {
-		return nil, err
-	}
-	return rroot, nil
+	return root.NewFromJSON(rkv.Data)
 }
 
 // Borrowed from https://github.com/ipfs/go-ipfs/blob/master/fuse/mount/mount.go
@@ -473,6 +473,7 @@ func main() {
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		for _ = range t.C {
+			fslog.Info(fmt.Sprintf("latest=%+v,staging=%+v,mount=%+v", bfs.latest, bfs.staging, bfs.mount))
 			if stats.updated {
 				fslog.Info(stats.String())
 				fslog.Debug("Flushing stats")
@@ -481,11 +482,13 @@ func main() {
 		}
 	}()
 
+	sockPath := fmt.Sprintf("/tmp/blobfs_%s.sock", name)
+
 	go func() {
 		api := &API{}
 		// TODO(tsileo): make the API port configurable
 		fslog.Info("Starting API at localhost:8049")
-		if err := api.Serve(); err != nil {
+		if err := api.Serve(sockPath); err != nil {
 			fslog.Crit("failed to start API")
 		}
 	}()
@@ -493,7 +496,7 @@ func main() {
 	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
 	bsOpts := blobstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
 	bsOpts.SnappyCompression = false
-	bs := cache.New(bsOpts, "blobfs_cache")
+	bs := cache.New(bsOpts, fmt.Sprintf("blobfs_cache_%s", name))
 	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
 	kvsOpts.SnappyCompression = false
 	kvs := kvstore.New(kvsOpts)
@@ -511,14 +514,18 @@ func main() {
 		os.Exit(1)
 	}
 	bfs = &FS{
-		log:       fslog,
-		name:      name,
-		bs:        bs,
-		kvs:       kvs,
-		uploader:  writer.NewUploader(bs),
-		immutable: *immutablePtr,
-		host:      bsOpts.Host,
-		sync:      make(chan *SyncReq),
+		log:        fslog,
+		socketPath: sockPath,
+		name:       name,
+		bs:         bs,
+		kvs:        kvs,
+		uploader:   writer.NewUploader(bs),
+		immutable:  *immutablePtr,
+		host:       bsOpts.Host,
+		sync:       make(chan *SyncReq),
+		latest:     &Mount{},
+		staging:    &Mount{},
+		mount:      &Mount{},
 	}
 
 	go func() {
@@ -530,14 +537,16 @@ func main() {
 				l.Debug("Sync triggered")
 
 				// XXX(tsileo): a getRoot to DRY?
-				rroot, err := getLatestRemoteRoot()
-				if err != nil {
-					l.Error("failed to fetch latest remote vkv entry", "err", err)
-					return
-				}
-				// FIXME(tsileo): a way to output the sync status to the HTTP handler
+				rroot, _ := getLatestRemoteRoot()
+
+				// 	if err != kvstore.ErrKeyNotFound {
+				// 		l.Error("failed to fetch latest remote vkv entry", "err", err)
+				// 		return
+				// 	}
+				// }
+				// // FIXME(tsileo): a way to output the sync status to the HTTP handler
 				// like: "already in sync"/"synced"/"conflict"
-				if rroot.Ref != bfs.latest.ref {
+				if rroot != nil && rroot.Ref != bfs.latest.ref {
 					l.Error("conflicted tree")
 					// FIXME(tsileo): return a conflicted status
 					return
@@ -596,7 +605,7 @@ func main() {
 					} else {
 						// Fetch the blob locally via the cache if needed
 						if blob == nil {
-							blob, err = bfs.bs.Get(hash)
+							blob, err = bfs.bs.Get(context.TODO(), hash)
 							if err != nil {
 								return err
 							}
@@ -645,7 +654,7 @@ func main() {
 				bfs.lastRootVersion = kv.Version
 				// Save the vkv entry in the remote vkv API
 				newRoot := &root.Root{}
-				if err := json.Unmarshal([]byte(kv.Value), newRoot); err != nil {
+				if err := json.Unmarshal([]byte(kv.Data), newRoot); err != nil {
 					return
 				}
 				newRoot.Comment = sr.Comment
@@ -653,14 +662,12 @@ func main() {
 				if err != nil {
 					return
 				}
-				if _, err := bfs.kvs.Put(kv.Key, string(newValue), kv.Version); err != nil {
+				if _, err := bfs.kvs.Put(kv.Key, "", newValue, kv.Version); err != nil {
 					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 					return
 				}
-				if bfs.latest == nil {
-					bfs.latest = &Mount{}
-				}
 				bfs.latest.ref = newRoot.Ref
+				bfs.latest.root = rootDir
 			}
 			select {
 			case sr := <-bfs.sync:
@@ -732,7 +739,8 @@ func (s *Stats) Reset() {
 	s.updated = false
 }
 func (s *Stats) String() string {
-	return fmt.Sprintf("%d files created, %d dirs created", s.FilesCreated, s.DirsCreated)
+	return fmt.Sprintf("%d files created, %d dirs created, %d files updated, %d dirs updated",
+		s.FilesCreated, s.DirsCreated, s.FilesUpdated, s.DirsUpdated)
 }
 
 // debugFile is a dummy file that hold a string
@@ -762,6 +770,7 @@ type FS struct {
 	kvs             *kvstore.KvStore
 	bs              *cache.Cache // blobstore.BlobStore
 	uploader        *writer.Uploader
+	socketPath      string
 	immutable       bool
 	name            string
 	host            string
@@ -781,6 +790,16 @@ type Mount struct {
 	ref       string
 }
 
+func (m *Mount) Empty() bool {
+	return m.ref == ""
+}
+
+func (m *Mount) Copy(m2 *Mount) {
+	m2.immutable = m.immutable
+	m2.root = m.root
+	m2.ref = m.ref
+}
+
 func (f *FS) Immutable() bool {
 	// TODO(tsileo): check the mount
 	return f.immutable
@@ -794,13 +813,14 @@ var rootKeyFmt = "blobfs:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
 	f.log.Info("OP Root")
-	if f.mount == nil {
+	if f.mount.ref == "" {
 		f.log.Info("loadRoot")
 		d, err := f.loadRoot()
 		if err != nil {
 			return nil, err
 		}
 		f.root = d
+		f.log.Debug("loaded root", "d", d)
 		return d, nil
 	}
 	f.log.Info("Root OP", "root", f.mount.root)
@@ -809,7 +829,7 @@ func (f *FS) Root() (fs.Node, error) {
 
 func (f *FS) setRoot(ref string, immutable bool) error {
 	f.log.Info("setRoot", "ref", ref)
-	blob, err := f.bs.Get(ref)
+	blob, err := f.bs.Get(context.TODO(), ref)
 	if err != nil {
 		return err
 	}
@@ -826,15 +846,16 @@ func (f *FS) setRoot(ref string, immutable bool) error {
 }
 
 func (f *FS) loadRoot() (fs.Node, error) {
+	// First, try to fetch the local root
 	var saveLocally bool
 	lkv, err := f.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
-		root, err := root.NewFromJSON([]byte(lkv.Value))
+		root, err := root.NewFromJSON([]byte(lkv.Data))
 		if err != nil {
 			return nil, err
 		}
-		blob, err := f.bs.Get(root.Ref)
+		blob, err := f.bs.Get(context.TODO(), root.Ref)
 		if err != nil {
 			return nil, err
 		}
@@ -848,7 +869,7 @@ func (f *FS) loadRoot() (fs.Node, error) {
 			return nil, err
 		}
 		f.mount = &Mount{immutable: f.immutable, root: d, ref: m.Hash}
-		f.staging = f.mount
+		f.mount.Copy(f.staging)
 		// return d, nil
 	case vkv.ErrNotFound:
 		saveLocally = true
@@ -856,20 +877,21 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		return nil, err
 	}
 
+	// Then, try to fetch the remote root
 	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
 		f.lastRootVersion = kv.Version
 		if saveLocally {
-			if f.bs.Vkv().Put(kv.Key, kv.Value, kv.Version); err != nil {
+			if f.bs.Vkv().Put(kv.Key, kv.Hash, kv.Data, kv.Version); err != nil {
 				return nil, err
 			}
 		}
-		root, err := root.NewFromJSON([]byte(kv.Value))
+		root, err := root.NewFromJSON(kv.Data)
 		if err != nil {
 			return nil, err
 		}
-		blob, err := f.bs.Get(root.Ref)
+		blob, err := f.bs.Get(context.TODO(), root.Ref)
 		if err != nil {
 			return nil, err
 		}
@@ -883,10 +905,10 @@ func (f *FS) loadRoot() (fs.Node, error) {
 			return nil, err
 		}
 		cmount := &Mount{immutable: f.immutable, root: d, ref: m.Hash}
-		if f.staging == nil {
+		if f.staging.ref != "" {
 			f.mount = cmount
 		}
-		f.latest = cmount
+		cmount.Copy(f.latest)
 		// return d, nil
 	case kvstore.ErrKeyNotFound:
 		root := &Dir{
@@ -903,15 +925,12 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		f.log.Debug("Creating a new root", "ref", root.meta.Hash)
 		root.log = root.log.New("ref", root.meta.Hash)
 		f.mount = &Mount{immutable: f.immutable, root: root, ref: root.meta.Hash}
-		f.latest = f.mount
+		f.mount.Copy(f.latest)
 	default:
 		return nil, err
 	}
 	f.log.Info("initial load", "mount", f.mount, "latest", f.latest, "staging", f.staging)
-	if f.staging != nil {
-		return f.staging.root, nil
-	}
-	return f.latest.root, nil
+	return f.mount.root, nil
 }
 
 // Dir implements both Node and Handle for the root directory.
@@ -944,8 +963,9 @@ func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 
 func (d *Dir) reload() error {
 	d.log.Info("Reload")
+	d.Children2 = map[string]fs.Node{}
 	for _, ref := range d.meta.Refs {
-		blob, err := d.fs.bs.Get(ref.(string))
+		blob, err := d.fs.bs.Get(context.TODO(), ref.(string))
 		if err != nil {
 			return err
 		}
@@ -953,7 +973,6 @@ func (d *Dir) reload() error {
 		if err != nil {
 			return err
 		}
-		d.Children[m.Name] = m
 		if m.IsDir() {
 			ndir, err := NewDir(d.fs, m, d)
 			if err != nil {
@@ -972,6 +991,7 @@ func (d *Dir) reload() error {
 }
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
+	d.log.Debug("OP Attr")
 	a.Inode = 1
 	a.Mode = os.ModeDir | 0555
 	return nil
@@ -1091,16 +1111,19 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
 	if node, ok := d.Children2[req.OldName]; ok {
-		// FIXME(tsileo): update the name of the meta
-		m := d.Children[req.OldName]
-		m2, err := d.fs.uploader.RenameMeta(m, req.NewName)
-		if err != nil {
+		var meta *meta.Meta
+		switch node.(type) {
+		case *Dir:
+			meta = node.(*Dir).meta
+		case *File:
+			meta = node.(*File).Meta
+		}
+		if err := d.fs.uploader.RenameMeta(meta, req.NewName); err != nil {
 			return err
 		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		// Delete the source
-		delete(d.Children, req.OldName)
 		delete(d.Children2, req.OldName)
 		if err := d.save(false); err != nil {
 			return err
@@ -1110,14 +1133,13 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 			ndir.mu.Lock()
 			defer ndir.mu.Unlock()
 		}
-		ndir.Children[req.NewName] = m2
 		ndir.Children2[req.NewName] = node
 		switch n := node.(type) {
 		case *Dir:
 			n.Name = req.NewName
-			n.meta = m2
+			n.meta = node.(*Dir).meta
 		case *File:
-			n.Meta = m2
+			n.Meta = node.(*File).Meta
 		}
 		ndir.Children2[req.NewName] = node
 		if err := ndir.save(false); err != nil {
@@ -1136,13 +1158,13 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		// FIXME(tsileo): set the value dynamically
 		return newDebugFile("http://localhost:8049"), nil
 	}
+	if name == ".blobfs_socket" {
+		// FIXME(tsileo): set the value dynamically
+		return newDebugFile(d.fs.socketPath), nil
+	}
+
 	if c, ok := d.Children2[name]; ok {
 		return c, nil
-		// if c.IsFile() {
-		// 	return NewFile(d.fs, c, d)
-		// } else {
-		// 	return NewDir(d.fs, c, d)
-		// }
 	}
 	return nil, fuse.ENOENT
 }
@@ -1189,7 +1211,6 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.Children[newdir.Name] = newdir.meta
 	d.Children2[newdir.Name] = newdir
 	if err := d.save(false); err != nil {
 		return nil, err
@@ -1212,7 +1233,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if d.fs.Immutable() {
 		return fuse.EPERM
 	}
-	delete(d.Children, req.Name)
+	delete(d.Children2, req.Name)
 	if err := d.save(false); err != nil {
 		d.log.Error("Failed to saved", "err", err)
 		return err
@@ -1260,15 +1281,13 @@ func (d *Dir) save(sync bool) error {
 			return err
 		}
 		// XXX(tsileo): mark1
-		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), string(js), -1); err != nil {
+		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), "", js, -1); err != nil {
 			return err
 		}
-		if d.fs.staging == nil {
-			d.fs.staging = &Mount{}
-		}
 		d.fs.staging.ref = mhash
-	}
-	if d.parent != nil {
+		d.fs.staging.root = d
+		d.fs.staging.Copy(d.fs.mount)
+	} else {
 		d.parent.mu.Lock()
 		defer d.parent.mu.Unlock()
 		d.parent.Children[d.Name] = m
@@ -1325,7 +1344,6 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if f == nil {
 		return nil, nil, err
 	}
-	d.Children[m.Name] = m
 	d.Children2[m.Name] = f
 	if err := d.save(false); err != nil {
 		return nil, nil, err
@@ -1501,25 +1519,39 @@ func (f *File) Forget() {
 }
 
 func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	fs.log.Debug("handleGetxattr", "name", req.Name)
 	// Check if the request match a virtual extended attributes
 	if xattrFunc, ok := virtualXAttrs[req.Name]; ok && xattrFunc != nil {
 		resp.Xattr = xattrFunc(m)
 		return nil
 	}
 
-	if m.XAttrs == nil {
-		return fuse.ErrNoXattr
+	if req.Name == "url.semiprivate" {
+		client := fs.bs.Client()
+		nodeResp, err := client.DoReq("HEAD", "/api/filetree/node/"+m.Hash+"?bewit=1", nil, nil)
+		if err != nil {
+			return err
+		}
+		if nodeResp.StatusCode != 200 {
+			return fmt.Errorf("bad status code: %d", nodeResp.StatusCode)
+		}
+		bewit := nodeResp.Header.Get("BlobStash-FileTree-Bewit")
+		raw_url := fmt.Sprintf("%s/%s/%s?bewit=%s", fs.host, m.Type[0:1], m.Hash, bewit)
+		resp.Xattr = []byte(raw_url)
+		return nil
 	}
 
-	if req.Name == "url" {
+	if req.Name == "url" && m.IsPublic() {
 		// Ensure the node is public
-		if m.IsPublic() {
-			// FIXME(tsileo): fetch the hostname from `bfs` to reconstruct an absolute URL
-			// Output the URL
-			raw_url := fmt.Sprintf("%s/%s/%s", fs.host, m.Type[0:1], m.Hash)
-			resp.Xattr = []byte(raw_url)
-			return nil
-		}
+		// FIXME(tsileo): fetch the hostname from `bfs` to reconstruct an absolute URL
+		// Output the URL
+		raw_url := fmt.Sprintf("%s/%s/%s", fs.host, m.Type[0:1], m.Hash)
+		resp.Xattr = []byte(raw_url)
+		return nil
+	}
+
+	if m.XAttrs == nil {
+		return fuse.ErrNoXattr
 	}
 
 	if _, ok := m.XAttrs[req.Name]; ok {
