@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"sort"
 	"text/tabwriter"
 	"time"
 
@@ -56,7 +55,7 @@ func isPublic(path string) (bool, error) {
 }
 
 func main() {
-	commentPtr := flag.String("comment", "", "optional commit comment")
+	// commentPtr := flag.String("comment", "", "optional commit comment")
 	publicPtr := flag.Bool("public", false, "share the node publicly (default to semi-private)")
 	// shareTTLPtr := flag.String("share-ttl", "1h", "TTL for the semi-private sharing linl (default to 1h)")
 
@@ -134,10 +133,6 @@ func main() {
 	}
 	url := string(u)
 	switch cmd {
-	case "commit":
-		if err := Commit(client, url, *commentPtr); err != nil {
-			panic(err)
-		}
 	case "checkout":
 		if err := Checkout(client, url, flag.Arg(1)); err != nil {
 			panic(err)
@@ -146,8 +141,8 @@ func main() {
 		if err := Log(client, url); err != nil {
 			panic(err)
 		}
-	case "status":
-		if err := Status(client, url); err != nil {
+	case "sync", "push":
+		if err := Sync(client, url); err != nil {
 			panic(err)
 		}
 	case "share":
@@ -242,8 +237,57 @@ func buildStatusIndex(in []string) map[string]struct{} {
 	return out
 }
 
-func Status(client http.Client, u string) error {
-	request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/status"), nil)
+// func Status(client http.Client, u string) error {
+// 	request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/status"), nil)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	resp, err := client.Do(request)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	if resp.StatusCode == 204 {
+// 		return nil
+// 	}
+// 	if resp.StatusCode != 200 {
+// 		return fmt.Errorf("http %d", resp.StatusCode)
+// 	}
+// 	sr := &StatusResp{}
+// 	if err := json.NewDecoder(resp.Body).Decode(sr); err != nil {
+// 		return err
+// 	}
+// 	deletedIndex := buildStatusIndex(sr.Deleted)
+// 	modifiedIndex := buildStatusIndex(sr.Modified)
+// 	addedIndex := buildStatusIndex(sr.Added)
+// 	paths := []string{}
+// 	for _, p := range sr.Added {
+// 		paths = append(paths, p)
+// 	}
+// 	for _, p := range sr.Deleted {
+// 		paths = append(paths, p)
+// 	}
+// 	for _, p := range sr.Modified {
+// 		paths = append(paths, p)
+// 	}
+// 	sort.Strings(paths)
+// 	for _, p := range paths {
+// 		var letter string
+// 		if _, ok := addedIndex[p]; ok {
+// 			letter = "A"
+// 		}
+// 		if _, ok := modifiedIndex[p]; ok {
+// 			letter = "M"
+// 		}
+// 		if _, ok := deletedIndex[p]; ok {
+// 			letter = "D"
+// 		}
+// 		fmt.Printf("%s  %s\n", yellow(letter), p)
+// 	}
+// 	return nil
+// }
+
+func Sync(client http.Client, u string) error {
+	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), nil)
 	if err != nil {
 		return err
 	}
@@ -251,42 +295,8 @@ func Status(client http.Client, u string) error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode == 204 {
-		return nil
-	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 204 {
 		return fmt.Errorf("http %d", resp.StatusCode)
-	}
-	sr := &StatusResp{}
-	if err := json.NewDecoder(resp.Body).Decode(sr); err != nil {
-		return err
-	}
-	deletedIndex := buildStatusIndex(sr.Deleted)
-	modifiedIndex := buildStatusIndex(sr.Modified)
-	addedIndex := buildStatusIndex(sr.Added)
-	paths := []string{}
-	for _, p := range sr.Added {
-		paths = append(paths, p)
-	}
-	for _, p := range sr.Deleted {
-		paths = append(paths, p)
-	}
-	for _, p := range sr.Modified {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
-	for _, p := range paths {
-		var letter string
-		if _, ok := addedIndex[p]; ok {
-			letter = "A"
-		}
-		if _, ok := modifiedIndex[p]; ok {
-			letter = "M"
-		}
-		if _, ok := deletedIndex[p]; ok {
-			letter = "D"
-		}
-		fmt.Printf("%s  %s\n", yellow(letter), p)
 	}
 	return nil
 }
@@ -334,25 +344,6 @@ func Checkout(client http.Client, u, ref string) error {
 		return err
 	}
 	if resp.StatusCode == 200 {
-		return nil
-	}
-	return fmt.Errorf("http %d", resp.StatusCode)
-}
-
-func Commit(client http.Client, u, msg string) error {
-	body, err := json.Marshal(map[string]interface{}{"comment": msg})
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == 204 {
 		return nil
 	}
 	return fmt.Errorf("http %d", resp.StatusCode)

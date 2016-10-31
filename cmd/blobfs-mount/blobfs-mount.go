@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	_ "io"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -74,11 +74,7 @@ type API struct {
 }
 
 func (api *API) Serve(socketPath string) error {
-	http.HandleFunc("/", apiIndexHandler)
 	http.HandleFunc("/ref", apiRefHandler)
-	http.HandleFunc("/stats", apiStatsHandler)
-	http.HandleFunc("/checkout", apiCheckoutHandler)
-	http.HandleFunc("/status", apiStatusHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
 	http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
@@ -92,25 +88,6 @@ func (api *API) Serve(socketPath string) error {
 		panic(err)
 	}
 	return nil
-}
-
-func apiIndexHandler(w http.ResponseWriter, r *http.Request) {
-	WriteJSON(w, map[string]interface{}{
-		"stats":    bfs.host + "/stats",
-		"sync":     bfs.host + "/sync",
-		"public":   bfs.host + "/public",
-		"checkout": bfs.host + "/checkout",
-		"log":      bfs.host + "/log",
-	})
-}
-
-func apiStatsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-	stats.Lock()
-	defer stats.Unlock()
-	WriteJSON(w, stats)
 }
 
 type NodeStatus struct {
@@ -162,60 +139,52 @@ func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
 }
 
 func apiRefHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO(tsileo): turn this into a HEAD request, and return the Ref as a header
-	var ref string
-	if bfs.mount.ref == bfs.latest.ref {
-		ref = "LATEST"
-	} else if bfs.mount.ref == bfs.staging.ref {
-		ref = "STAGING"
-	} else {
-		ref = bfs.mount.ref[:10]
-	}
-	WriteJSON(w, map[string]string{"ref": ref})
+	WriteJSON(w, map[string]string{"ref": bfs.mount.ref})
 }
 
-func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
-	if bfs.mount.ref != bfs.staging.ref {
-		// No changes, returns a 204
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if bfs.mount.ref != bfs.staging.ref || bfs.staging.root == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	added := []string{}
-	deleted := []string{}
-	modified := []string{}
-	_, latestIndex := DirToStatus(bfs.latest.root.(*Dir))
-	_, stagingIndex := DirToStatus(bfs.staging.root.(*Dir))
+// TODO(tsileo): re-use this as for a diff subcommand?
+// func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
+// 	if bfs.mount.ref != bfs.staging.ref {
+// 		// No changes, returns a 204
+// 		w.WriteHeader(http.StatusNoContent)
+// 		return
+// 	}
+// 	if bfs.mount.ref != bfs.staging.ref || bfs.staging.root == nil {
+// 		w.WriteHeader(http.StatusNoContent)
+// 		return
+// 	}
+// 	added := []string{}
+// 	deleted := []string{}
+// 	modified := []string{}
+// 	_, latestIndex := DirToStatus(bfs.latest.root.(*Dir))
+// 	_, stagingIndex := DirToStatus(bfs.staging.root.(*Dir))
 
-	// XXX(tsileo): what abour **R**enamed
+// 	// XXX(tsileo): what abour **R**enamed
 
-	for path, ns := range stagingIndex {
-		if lns, ok := latestIndex[path]; ok {
-			if ns.Ref != lns.Ref {
-				modified = append(modified, ns.Path)
-			}
-		} else {
-			added = append(added, ns.Path)
-		}
-	}
-	for path, ns := range latestIndex {
-		if _, ok := stagingIndex[path]; !ok {
-			deleted = append(deleted, ns.Path)
-		}
-	}
+// 	for path, ns := range stagingIndex {
+// 		if lns, ok := latestIndex[path]; ok {
+// 			if ns.Ref != lns.Ref {
+// 				modified = append(modified, ns.Path)
+// 			}
+// 		} else {
+// 			added = append(added, ns.Path)
+// 		}
+// 	}
+// 	for path, ns := range latestIndex {
+// 		if _, ok := stagingIndex[path]; !ok {
+// 			deleted = append(deleted, ns.Path)
+// 		}
+// 	}
 
-	WriteJSON(w, map[string]interface{}{
-		"ref":      bfs.mount.ref,
-		"added":    added,
-		"modified": modified,
-		"deleted":  deleted,
-		// "latest":   latest,
-		// "staging":  staging,
-	})
-}
+// 	WriteJSON(w, map[string]interface{}{
+// 		"ref":      bfs.mount.ref,
+// 		"added":    added,
+// 		"modified": modified,
+// 		"deleted":  deleted,
+// 		// "latest":   latest,
+// 		// "staging":  staging,
+// 	})
+// }
 
 type CheckoutReq struct {
 	Ref string `json:"ref"`
@@ -232,24 +201,14 @@ func apiCheckoutHandler(w http.ResponseWriter, r *http.Request) {
 			panic(err)
 		}
 	}
-	switch cr.Ref {
-	case "LATEST":
-		cr.Ref = bfs.latest.ref
-	case "STAGING":
-		if bfs.staging == nil {
-			cr.Ref = bfs.latest.ref
-		}
-		cr.Ref = bfs.staging.ref
+	var immutable bool
+	if cr.Ref == bfs.latest.ref {
+		immutable = true
 	}
-	// FIXME(tsileo): Check if cr.Ref == lastRef, and if so make it mutable
-	if err := bfs.setRoot(cr.Ref, true); err != nil {
+	if err := bfs.setRoot(cr.Ref, immutable); err != nil {
 		panic(err)
 	}
 	WriteJSON(w, cr)
-}
-
-type SyncReq struct {
-	Comment string `json:"comment"`
 }
 
 func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
@@ -257,14 +216,7 @@ func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
 		return
 	}
-	sr := &SyncReq{}
-	if err := json.NewDecoder(r.Body).Decode(sr); err != nil {
-		if err != nil {
-			panic(err)
-		}
-	}
-	// FIXME(tsileo): sync with an optional comment read from the body
-	bfs.sync <- sr
+	bfs.sync <- struct{}{}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -336,12 +288,6 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 				Ref:     croot.Ref,
 				Comment: croot.Comment,
 			}
-			if cl.Ref == bfs.latest.ref {
-				cl.Ref = "LATEST"
-			}
-			if bfs.mount.ref == cl.Ref {
-				cl.Current = true
-			}
 			out = append(out, cl)
 		}
 	default:
@@ -381,7 +327,7 @@ func apiCacheHandler(w http.ResponseWriter, r *http.Request) {
 
 // iterDir executes the given callback `cb` on each nodes (file or dir) recursively.
 func iterDir(dir *Dir, cb func(n fs.Node) error) error {
-	for _, node := range dir.Children2 {
+	for _, node := range dir.Children {
 		switch n := node.(type) {
 		case *File:
 			if err := cb(n); err != nil {
@@ -481,6 +427,13 @@ func main() {
 			}
 		}
 	}()
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		for _ = range t.C {
+			fslog.Debug("trigger sync")
+			bfs.sync <- struct{}{}
+		}
+	}()
 
 	sockPath := fmt.Sprintf("/tmp/blobfs_%s.sock", name)
 
@@ -522,7 +475,7 @@ func main() {
 		uploader:   writer.NewUploader(bs),
 		immutable:  *immutablePtr,
 		host:       bsOpts.Host,
-		sync:       make(chan *SyncReq),
+		sync:       make(chan struct{}),
 		latest:     &Mount{},
 		staging:    &Mount{},
 		mount:      &Mount{},
@@ -530,7 +483,7 @@ func main() {
 
 	go func() {
 		for {
-			sync := func(sr *SyncReq) {
+			sync := func() {
 				wg.Add(1)
 				defer wg.Done()
 				l := fslog.New("module", "sync")
@@ -611,6 +564,7 @@ func main() {
 							}
 
 						}
+						l.Debug("Uploading blob", "hash", hash)
 						if err := bfs.bs.PutRemote(hash, blob); err != nil {
 							l.Error("put failed", "err", err)
 							return err
@@ -657,7 +611,8 @@ func main() {
 				if err := json.Unmarshal([]byte(kv.Data), newRoot); err != nil {
 					return
 				}
-				newRoot.Comment = sr.Comment
+				// XXX(tsileo: log the host?
+				// newRoot.Comment = sr.Comment
 				newValue, err := json.Marshal(newRoot)
 				if err != nil {
 					return
@@ -666,13 +621,13 @@ func main() {
 					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 					return
 				}
-				bfs.latest.ref = newRoot.Ref
-				bfs.latest.root = rootDir
+				// bfs.latest.ref = newRoot.Ref
+				// bfs.latest.root = rootDir
 			}
 			select {
-			case sr := <-bfs.sync:
+			case <-bfs.sync:
 				fslog.Info("Sync triggered")
-				sync(sr)
+				sync()
 			}
 		}
 	}()
@@ -776,7 +731,7 @@ type FS struct {
 	host            string
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
-	sync            chan *SyncReq
+	sync            chan struct{}
 	lastWrite       time.Time
 	root            fs.Node
 	mount           *Mount
@@ -847,6 +802,124 @@ func (f *FS) setRoot(ref string, immutable bool) error {
 
 func (f *FS) loadRoot() (fs.Node, error) {
 	// First, try to fetch the local root
+	var rootNode *Dir
+	var newRoot *Dir
+	var localRoot *Dir
+	var remoteRoot *Dir
+	lkv, err := f.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
+	switch err {
+	case nil:
+		lroot, err := root.NewFromJSON([]byte(lkv.Data))
+		if err != nil {
+			return nil, err
+		}
+		f.log.Debug("decoding root", "root", lroot)
+		blob, err := f.bs.Get(context.TODO(), lroot.Ref)
+		if err != nil {
+			return nil, err
+		}
+		m, err := meta.NewMetaFromBlob(lroot.Ref, blob)
+		if err != nil {
+			return nil, err
+		}
+		f.log.Debug("loaded meta root", "ref", m.Hash)
+		d, err := NewDir(f, m, nil)
+		if err != nil {
+			return nil, err
+		}
+		localRoot = d
+		// f.mount = &Mount{immutable: f.immutable, root: d, ref: m.Hash}
+		// f.mount.Copy(f.staging)
+		// return d, nil
+	case vkv.ErrNotFound:
+	default:
+		return nil, err
+	}
+
+	// Then, try to fetch the remote root
+	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
+	switch err {
+	case nil:
+		f.lastRootVersion = kv.Version
+		if lkv == nil {
+			if f.bs.Vkv().Put(kv.Key, kv.Hash, kv.Data, kv.Version); err != nil {
+				return nil, err
+			}
+		}
+		rroot, err := root.NewFromJSON(kv.Data)
+		if err != nil {
+			return nil, err
+		}
+		blob, err := f.bs.Get(context.TODO(), rroot.Ref)
+		if err != nil {
+			return nil, err
+		}
+		m, err := meta.NewMetaFromBlob(rroot.Ref, blob)
+		if err != nil {
+			return nil, err
+		}
+		f.log.Debug("loaded meta root", "ref", m.Hash)
+		d, err := NewDir(f, m, nil)
+		if err != nil {
+			return nil, err
+		}
+		remoteRoot = d
+		cmount := &Mount{immutable: f.immutable, root: d, ref: m.Hash}
+		if f.staging.ref != "" {
+			f.mount = cmount
+		}
+		cmount.Copy(f.latest)
+		// return d, nil
+	case kvstore.ErrKeyNotFound:
+		if lkv == nil {
+			newRoot = &Dir{
+				fs:       f,
+				Name:     "_root",
+				Children: map[string]fs.Node{},
+				meta:     &meta.Meta{},
+			}
+			newRoot.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
+			if err := newRoot.save(false); err != nil {
+				return nil, err
+			}
+			f.log.Debug("Creating a new root", "ref", newRoot.meta.Hash)
+		}
+		// root.log = root.log.New("ref", root.meta.Hash)
+		// f.mount = &Mount{immutable: f.immutable, root: root, ref: root.meta.Hash}
+		// f.mount.Copy(f.latest)
+	default:
+		return nil, err
+	}
+	switch {
+	case localRoot == nil && remoteRoot != nil:
+		rootNode = remoteRoot
+	case localRoot != nil && remoteRoot == nil:
+		rootNode = localRoot
+	case localRoot != nil && remoteRoot != nil:
+		t1, err := localRoot.meta.Mtime()
+		if err != nil {
+			return nil, err
+		}
+		t2, err := remoteRoot.meta.Mtime()
+		if err != nil {
+			return nil, err
+		}
+		if t1.After(t2) {
+			rootNode = localRoot
+		} else {
+			rootNode = remoteRoot
+		}
+	case newRoot != nil:
+		rootNode = newRoot
+	}
+	f.log.Info("initial load", "mount", f.mount, "latest", f.latest, "staging", f.staging)
+	f.mount = &Mount{immutable: f.immutable, root: rootNode, ref: rootNode.meta.Hash}
+	f.mount.Copy(f.latest)
+	return f.mount.root, nil
+}
+
+func (f *FS) loadRoot2() (fs.Node, error) {
+	// First, try to fetch the local root
 	var saveLocally bool
 	lkv, err := f.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
@@ -855,6 +928,7 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		if err != nil {
 			return nil, err
 		}
+		f.log.Debug("decoding root", "root", root)
 		blob, err := f.bs.Get(context.TODO(), root.Ref)
 		if err != nil {
 			return nil, err
@@ -912,11 +986,10 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		// return d, nil
 	case kvstore.ErrKeyNotFound:
 		root := &Dir{
-			fs:        f,
-			Name:      "_root",
-			Children:  map[string]*meta.Meta{},
-			Children2: map[string]fs.Node{},
-			meta:      &meta.Meta{},
+			fs:       f,
+			Name:     "_root",
+			Children: map[string]fs.Node{},
+			meta:     &meta.Meta{},
 		}
 		root.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 		if err := root.save(false); err != nil {
@@ -935,25 +1008,23 @@ func (f *FS) loadRoot() (fs.Node, error) {
 
 // Dir implements both Node and Handle for the root directory.
 type Dir struct {
-	fs        *FS
-	meta      *meta.Meta
-	parent    *Dir
-	Name      string
-	Children  map[string]*meta.Meta
-	Children2 map[string]fs.Node
-	log       log15.Logger
-	mu        sync.Mutex
+	fs       *FS
+	meta     *meta.Meta
+	parent   *Dir
+	Name     string
+	Children map[string]fs.Node
+	log      log15.Logger
+	mu       sync.Mutex
 }
 
 func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 	d := &Dir{
-		fs:        rfs,
-		meta:      m,
-		parent:    parent,
-		Name:      m.Name,
-		Children:  map[string]*meta.Meta{},
-		Children2: map[string]fs.Node{},
-		log:       rfs.log.New("ref", m.Hash, "name", m.Name, "type", "dir"),
+		fs:       rfs,
+		meta:     m,
+		parent:   parent,
+		Name:     m.Name,
+		Children: map[string]fs.Node{},
+		log:      rfs.log.New("ref", m.Hash, "name", m.Name, "type", "dir"),
 	}
 	if err := d.reload(); err != nil {
 		return nil, err
@@ -963,8 +1034,9 @@ func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 
 func (d *Dir) reload() error {
 	d.log.Info("Reload")
-	d.Children2 = map[string]fs.Node{}
+	d.Children = map[string]fs.Node{}
 	for _, ref := range d.meta.Refs {
+		d.log.Debug("Trying to fetch ref", "hash", ref.(string))
 		blob, err := d.fs.bs.Get(context.TODO(), ref.(string))
 		if err != nil {
 			return err
@@ -978,13 +1050,13 @@ func (d *Dir) reload() error {
 			if err != nil {
 				return err
 			}
-			d.Children2[m.Name] = ndir
+			d.Children[m.Name] = ndir
 		} else {
 			nfile, err := NewFile(d.fs, m, d)
 			if err != nil {
 				return err
 			}
-			d.Children2[m.Name] = nfile
+			d.Children[m.Name] = nfile
 		}
 	}
 	return nil
@@ -1008,7 +1080,7 @@ func makePublic(n fs.Node, value string) error {
 		if err := node.save(false); err != nil {
 			return err
 		}
-		for _, child := range node.Children2 {
+		for _, child := range node.Children {
 			if err := makePublic(child, value); err != nil {
 				return err
 			}
@@ -1052,9 +1124,9 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	}
 
 	// // Trigger a sync so the file will be (un)available for BlobStash right now
-	// if req.Name == "public" {
-	// 	bfs.sync <- struct{}{}
-	// }
+	if req.Name == "public" {
+		bfs.sync <- struct{}{}
+	}
 	return nil
 }
 
@@ -1080,9 +1152,9 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 		}
 
 		// // Trigger a sync so the file won't be available via BlobStash
-		// if req.Name == "public" {
-		// 	bfs.sync <- struct{}{}
-		// }
+		if req.Name == "public" {
+			bfs.sync <- struct{}{}
+		}
 
 		return nil
 	}
@@ -1110,7 +1182,7 @@ func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fus
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
-	if node, ok := d.Children2[req.OldName]; ok {
+	if node, ok := d.Children[req.OldName]; ok {
 		var meta *meta.Meta
 		switch node.(type) {
 		case *Dir:
@@ -1124,7 +1196,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		// Delete the source
-		delete(d.Children2, req.OldName)
+		delete(d.Children, req.OldName)
 		if err := d.save(false); err != nil {
 			return err
 		}
@@ -1133,7 +1205,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 			ndir.mu.Lock()
 			defer ndir.mu.Unlock()
 		}
-		ndir.Children2[req.NewName] = node
+		ndir.Children[req.NewName] = node
 		switch n := node.(type) {
 		case *Dir:
 			n.Name = req.NewName
@@ -1141,7 +1213,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		case *File:
 			n.Meta = node.(*File).Meta
 		}
-		ndir.Children2[req.NewName] = node
+		ndir.Children[req.NewName] = node
 		if err := ndir.save(false); err != nil {
 			return err
 		}
@@ -1153,17 +1225,14 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	d.log.Debug("OP Lookup", "name", name)
 	defer d.log.Debug("OP Lookup END", "name", name)
-	// normal lookup operation
-	if name == ".blobfs_url" {
-		// FIXME(tsileo): set the value dynamically
-		return newDebugFile("http://localhost:8049"), nil
-	}
+
+	// Magic file for returnign the socket path, available in every directory
 	if name == ".blobfs_socket" {
-		// FIXME(tsileo): set the value dynamically
 		return newDebugFile(d.fs.socketPath), nil
 	}
 
-	if c, ok := d.Children2[name]; ok {
+	// normal lookup operation
+	if c, ok := d.Children[name]; ok {
 		return c, nil
 	}
 	return nil, fuse.ENOENT
@@ -1174,16 +1243,17 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	defer d.log.Debug("OP ReadDirAll END")
 	dirs := []fuse.Dirent{}
 	for _, c := range d.Children {
-		if c.IsDir() {
+		switch node := c.(type) {
+		case *Dir:
 			dirs = append(dirs, fuse.Dirent{
 				Inode: 1,
-				Name:  c.Name,
+				Name:  node.meta.Name,
 				Type:  fuse.DT_Dir,
 			})
-		} else {
+		case *File:
 			dirs = append(dirs, fuse.Dirent{
 				Inode: 2,
-				Name:  c.Name,
+				Name:  node.Meta.Name,
 				Type:  fuse.DT_File,
 			})
 		}
@@ -1198,12 +1268,11 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		return nil, fuse.EPERM
 	}
 	newdir := &Dir{
-		fs:        d.fs,
-		parent:    d,
-		Name:      req.Name,
-		Children:  map[string]*meta.Meta{},
-		Children2: map[string]fs.Node{},
-		meta:      &meta.Meta{},
+		fs:       d.fs,
+		parent:   d,
+		Name:     req.Name,
+		Children: map[string]fs.Node{},
+		meta:     &meta.Meta{},
 	}
 	newdir.log = d.fs.log.New("ref", "unknown", "name", req.Name, "type", "dir")
 	if err := newdir.save(false); err != nil {
@@ -1211,7 +1280,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.Children2[newdir.Name] = newdir
+	d.Children[newdir.Name] = newdir
 	if err := d.save(false); err != nil {
 		return nil, err
 	}
@@ -1233,7 +1302,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if d.fs.Immutable() {
 		return fuse.EPERM
 	}
-	delete(d.Children2, req.Name)
+	delete(d.Children, req.Name)
 	if err := d.save(false); err != nil {
 		d.log.Error("Failed to saved", "err", err)
 		return err
@@ -1252,7 +1321,12 @@ func (d *Dir) save(sync bool) error {
 		m.ModTime = d.meta.ModTime
 	}
 	for _, c := range d.Children {
-		m.AddRef(c.Hash)
+		switch node := c.(type) {
+		case *Dir:
+			m.AddRef(node.meta.Hash)
+		case *File:
+			m.AddRef(node.Meta.Hash)
+		}
 	}
 	mhash, mjs := m.Json()
 	if sync && d.meta.Hash != mhash {
@@ -1290,7 +1364,6 @@ func (d *Dir) save(sync bool) error {
 	} else {
 		d.parent.mu.Lock()
 		defer d.parent.mu.Unlock()
-		d.parent.Children[d.Name] = m
 		if err := d.parent.save(sync); err != nil {
 			return err
 		}
@@ -1344,7 +1417,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if f == nil {
 		return nil, nil, err
 	}
-	d.Children2[m.Name] = f
+	d.Children[m.Name] = f
 	if err := d.save(false); err != nil {
 		return nil, nil, err
 	}
@@ -1355,6 +1428,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	return f, f, nil
 }
 
+type fileState struct {
+	updated bool
+}
+
 type File struct {
 	fs       *FS
 	data     []byte // FIXME(tsileo): if data grows too much, use a temp file
@@ -1363,23 +1440,18 @@ type File struct {
 	log      log15.Logger
 	parent   *Dir
 	flushed  bool
-	mu       sync.Mutex
+
+	state *fileState
+	mu    sync.Mutex
 }
 
 func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
-	// blob, err := fs.bs.Get(m.Hash)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// m2, err := meta.NewMetaFromBlob(m.Hash, blob)
-	// if err != nil {
-	// 	return nil, err
-	// }
 	return &File{
 		parent:  parent,
 		fs:      fs,
 		Meta:    m,
 		log:     fs.log.New("ref", m.Hash, "name", m.Name, "type", "file"),
+		state:   &fileState{},
 		flushed: true,
 	}, nil
 }
@@ -1387,6 +1459,7 @@ func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.state.updated = true
 	if len(req.Data) > 0 {
 		f.flushed = false
 	}
@@ -1425,6 +1498,9 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	if f.fs.Immutable() {
 		return nil
 	}
+	if !f.state.updated {
+		return nil
+	}
 	f.Meta.Size = len(f.data)
 	if f.data != nil && len(f.data) > 0 {
 		// XXX(tsileo): data will be saved once the tree will be synced
@@ -1437,7 +1513,6 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		}
 		f.parent.mu.Lock()
 		defer f.parent.mu.Unlock()
-		f.parent.Children[m2.Name] = m2
 		if err := f.parent.save(false); err != nil {
 			return err
 		}
@@ -1446,6 +1521,7 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		f.log.Debug("Flushed", "data_len", len(f.data))
 		f.flushed = true
 	}
+	f.state.updated = false
 	return nil
 }
 
@@ -1468,9 +1544,9 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 		return err
 	}
 	// Trigger a sync so the file will be (un)available for BlobStash right now
-	// if req.Name == "public" {
-	// 	bfs.sync <- struct{}{}
-	// }
+	if req.Name == "public" {
+		bfs.sync <- struct{}{}
+	}
 	return nil
 }
 
@@ -1591,9 +1667,9 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 			return err
 		}
 		// Trigger a sync so the file won't be available via BlobStash
-		// if req.Name == "public" {
-		// 	bfs.sync <- struct{}{}
-		// }
+		if req.Name == "public" {
+			bfs.sync <- struct{}{}
+		}
 		return nil
 
 	}
@@ -1691,6 +1767,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 		f.FakeFile = nil
 	}
 	// TODO(tsileo): maybe set the data to nil on close?
+	f.flushed = false
 	// f.data = nil
 	return nil
 }
@@ -1704,22 +1781,26 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
-	// if f.flushed && f.FakeFile != nil {
-	// 	// if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
-	// 	if req.Offset >= int64(f.Meta.Size) {
-	// 		return nil
-	// 	}
-	// 	buf := make([]byte, req.Size)
-	// 	n, err := f.FakeFile.ReadAt(buf, req.Offset)
-	// 	if err == io.EOF {
-	// 		err = nil
-	// 	}
-	// 	if err != nil {
-	// 		return fuse.EIO
-	// 	}
-	// 	res.Data = buf[:n]
-	// } else {
+	if f.Meta.Size != len(f.data) {
+		fuseutil.HandleRead(req, res, f.data)
+		return nil
+	}
+	if f.FakeFile != nil {
+		// if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
+		if req.Offset >= int64(f.Meta.Size) {
+			return nil
+		}
+		buf := make([]byte, req.Size)
+		n, err := f.FakeFile.ReadAt(buf, req.Offset)
+		if err == io.EOF {
+			err = nil
+		}
+		if err != nil {
+			return fuse.EIO
+		}
+		res.Data = buf[:n]
+		return nil
+	}
 	fuseutil.HandleRead(req, res, f.data)
-	// }
 	return nil
 }
