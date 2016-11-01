@@ -20,11 +20,12 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"bazil.org/fuse/fuseutil"
+	_ "bazil.org/fuse/fuseutil"
 	"github.com/tsileo/blobfs/pkg/cache"
 	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/kvstore"
+	"github.com/tsileo/blobstash/pkg/config/pathutil"
 	"github.com/tsileo/blobstash/pkg/filetree/filetreeutil/meta"
 	"github.com/tsileo/blobstash/pkg/filetree/reader/filereader"
 	"github.com/tsileo/blobstash/pkg/filetree/writer"
@@ -82,8 +83,10 @@ func (api *API) Serve(socketPath string) error {
 	if err != nil {
 		panic(err)
 	}
-	defer l.Close()
-
+	defer func() {
+		l.Close()
+		os.Remove(socketPath)
+	}()
 	if err := http.Serve(l, nil); err != nil {
 		panic(err)
 	}
@@ -466,18 +469,25 @@ func main() {
 		fslog.Crit("failed to mount", "err", err)
 		os.Exit(1)
 	}
+	kv, err := vkv.New(filepath.Join(pathutil.VarDir(), "blobsfs", name, "lkv"))
+	defer kv.Close()
+	if err != nil {
+		panic(err)
+	}
+
 	bfs = &FS{
 		log:        fslog,
 		socketPath: sockPath,
 		name:       name,
 		bs:         bs,
+		lkv:        kv,
 		kvs:        kvs,
 		uploader:   writer.NewUploader(bs),
 		immutable:  *immutablePtr,
 		host:       bsOpts.Host,
 		sync:       make(chan struct{}),
 		latest:     &Mount{},
-		staging:    &Mount{},
+		staging:    &Mount{}, // TODO(tsileo): remove staging
 		mount:      &Mount{},
 	}
 
@@ -492,11 +502,10 @@ func main() {
 				// XXX(tsileo): a getRoot to DRY?
 				rroot, _ := getLatestRemoteRoot()
 
-				// 	if err != kvstore.ErrKeyNotFound {
-				// 		l.Error("failed to fetch latest remote vkv entry", "err", err)
-				// 		return
-				// 	}
-				// }
+				if err != kvstore.ErrKeyNotFound {
+					l.Error("failed to fetch latest remote vkv entry", "err", err)
+					return
+				}
 				// // FIXME(tsileo): a way to output the sync status to the HTTP handler
 				// like: "already in sync"/"synced"/"conflict"
 				if rroot != nil && rroot.Ref != bfs.latest.ref {
@@ -723,6 +732,7 @@ func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
 type FS struct {
 	log             log15.Logger
 	kvs             *kvstore.KvStore
+	lkv             *vkv.DB
 	bs              *cache.Cache // blobstore.BlobStore
 	uploader        *writer.Uploader
 	socketPath      string
@@ -768,6 +778,9 @@ var rootKeyFmt = "blobfs:root:%v"
 
 func (f *FS) Root() (fs.Node, error) {
 	f.log.Info("OP Root")
+	if f.root != nil {
+		return f.root, nil
+	}
 	if f.mount.ref == "" {
 		f.log.Info("loadRoot")
 		d, err := f.loadRoot()
@@ -778,8 +791,8 @@ func (f *FS) Root() (fs.Node, error) {
 		f.log.Debug("loaded root", "d", d)
 		return d, nil
 	}
-	f.log.Info("Root OP", "root", f.mount.root)
-	return f.mount.root, nil
+	f.log.Info("Root OP", "root", f.root)
+	return f.root, nil
 }
 
 func (f *FS) setRoot(ref string, immutable bool) error {
@@ -1019,15 +1032,11 @@ type Dir struct {
 
 func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 	d := &Dir{
-		fs:       rfs,
-		meta:     m,
-		parent:   parent,
-		Name:     m.Name,
-		Children: map[string]fs.Node{},
-		log:      rfs.log.New("ref", m.Hash, "name", m.Name, "type", "dir"),
-	}
-	if err := d.reload(); err != nil {
-		return nil, err
+		fs:     rfs,
+		meta:   m,
+		parent: parent,
+		Name:   m.Name,
+		log:    rfs.log.New("ref", m.Hash, "name", m.Name, "type", "dir"),
 	}
 	return d, nil
 }
@@ -1182,6 +1191,13 @@ func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fus
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
+
+	if d.Children == nil {
+		if err := d.reload(); err != nil {
+			return err
+		}
+	}
+
 	if node, ok := d.Children[req.OldName]; ok {
 		var meta *meta.Meta
 		switch node.(type) {
@@ -1232,6 +1248,12 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	}
 
 	// normal lookup operation
+	if d.Children == nil {
+		if err := d.reload(); err != nil {
+			return nil, err
+		}
+	}
+
 	if c, ok := d.Children[name]; ok {
 		return c, nil
 	}
@@ -1241,12 +1263,19 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	d.log.Debug("OP ReadDirAll")
 	defer d.log.Debug("OP ReadDirAll END")
+
+	if d.Children == nil {
+		if err := d.reload(); err != nil {
+			return nil, err
+		}
+	}
+
 	dirs := []fuse.Dirent{}
 	for _, c := range d.Children {
 		switch node := c.(type) {
 		case *Dir:
 			dirs = append(dirs, fuse.Dirent{
-				Inode: 1,
+				Inode: 1, // FIXME(tsileo): Generate Inode everywhere
 				Name:  node.meta.Name,
 				Type:  fuse.DT_Dir,
 			})
@@ -1264,9 +1293,17 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	d.log.Debug("OP Mkdir", "name", req.Name)
 	defer d.log.Debug("OP Mkdir END", "name", req.Name)
+
 	if d.fs.Immutable() {
 		return nil, fuse.EPERM
 	}
+
+	if d.Children == nil {
+		if err := d.reload(); err != nil {
+			return nil, err
+		}
+	}
+
 	newdir := &Dir{
 		fs:       d.fs,
 		parent:   d,
@@ -1302,6 +1339,13 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if d.fs.Immutable() {
 		return fuse.EPERM
 	}
+
+	if d.Children == nil {
+		if err := d.reload(); err != nil {
+			return err
+		}
+	}
+
 	delete(d.Children, req.Name)
 	if err := d.save(false); err != nil {
 		d.log.Error("Failed to saved", "err", err)
@@ -1354,7 +1398,6 @@ func (d *Dir) save(sync bool) error {
 		if err != nil {
 			return err
 		}
-		// XXX(tsileo): mark1
 		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), "", js, -1); err != nil {
 			return err
 		}
@@ -1379,6 +1422,13 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if d.fs.Immutable() {
 		return nil, nil, fuse.EPERM
 	}
+
+	if d.Children == nil {
+		if err := d.reload(); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	m := meta.NewMeta()
 	m.Type = "file"
 	m.Name = req.Name
@@ -1439,7 +1489,6 @@ type File struct {
 	FakeFile *filereader.File
 	log      log15.Logger
 	parent   *Dir
-	flushed  bool
 
 	state *fileState
 	mu    sync.Mutex
@@ -1447,12 +1496,11 @@ type File struct {
 
 func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
 	return &File{
-		parent:  parent,
-		fs:      fs,
-		Meta:    m,
-		log:     fs.log.New("ref", m.Hash, "name", m.Name, "type", "file"),
-		state:   &fileState{},
-		flushed: true,
+		parent: parent,
+		fs:     fs,
+		Meta:   m,
+		log:    fs.log.New("ref", m.Hash, "name", m.Name, "type", "file"),
+		state:  &fileState{},
 	}, nil
 }
 
@@ -1460,9 +1508,6 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.state.updated = true
-	if len(req.Data) > 0 {
-		f.flushed = false
-	}
 	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
 	defer f.log.Debug("OP Write END", "offset", req.Offset, "size", len(req.Data))
 	if f.fs.Immutable() {
@@ -1519,7 +1564,6 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 		f.Meta = m2
 		// f.log = f.log.New("ref", m2.Hash[:10])
 		f.log.Debug("Flushed", "data_len", len(f.data))
-		f.flushed = true
 	}
 	f.state.updated = false
 	return nil
@@ -1689,6 +1733,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 		}
 		a.Mtime = t
 	}
+	f.log.Debug("attrs", "a", a)
 	return nil
 }
 
@@ -1747,6 +1792,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 		if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
 			f.log.Debug("Open with fakefile")
 			f.FakeFile = filereader.NewFile(f.fs.bs, f.Meta)
+			// FIXME(tsileo): only if the buffer is small, or load a temp file?
 			var err error
 			f.data, err = ioutil.ReadAll(f.FakeFile)
 			if err != nil {
@@ -1766,9 +1812,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 		f.FakeFile.Close()
 		f.FakeFile = nil
 	}
-	// TODO(tsileo): maybe set the data to nil on close?
-	f.flushed = false
-	// f.data = nil
+	f.data = nil
 	return nil
 }
 
@@ -1781,26 +1825,26 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
-	if f.Meta.Size != len(f.data) {
-		fuseutil.HandleRead(req, res, f.data)
+	defer f.log.Debug("OP Read END", "offset", req.Offset, "size", req.Size)
+	// if f.data != nil && f.Meta.Size != len(f.data) {
+	// 	fuseutil.HandleRead(req, res, f.data)
+	// 	return nil
+	// }
+	// if f.FakeFile != nil {
+	if req.Offset >= int64(f.Meta.Size) {
 		return nil
 	}
-	if f.FakeFile != nil {
-		// if (f.data == nil || len(f.data) == 0) && f.FakeFile != nil {
-		if req.Offset >= int64(f.Meta.Size) {
-			return nil
-		}
-		buf := make([]byte, req.Size)
-		n, err := f.FakeFile.ReadAt(buf, req.Offset)
-		if err == io.EOF {
-			err = nil
-		}
-		if err != nil {
-			return fuse.EIO
-		}
-		res.Data = buf[:n]
-		return nil
+	buf := make([]byte, req.Size)
+	n, err := f.FakeFile.ReadAt(buf, req.Offset)
+	if err == io.EOF {
+		err = nil
 	}
-	fuseutil.HandleRead(req, res, f.data)
+	if err != nil {
+		return fuse.EIO
+	}
+	res.Data = buf[:n]
 	return nil
+	// }
+	// fuseutil.HandleRead(req, res, f.data)
+	// return nil
 }
