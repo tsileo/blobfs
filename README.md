@@ -40,11 +40,12 @@ newdoc
 
 ## TODOs
 
+- [ ] Better user support
+- [ ] Better attr support
 - [ ] A web UI (DropBox like, open source too) available on `my.blobfs.com` that connect to the user's BlobStash instance
 - [ ] `.ignore` file support
 - [ ] Basic automatic conflict resolution
-- [ ] Support BlobStash namespace
 - [ ] Watch the root key for update
-- [ ] bash/zsh subcommand autocompletion
-- [ ] A `put` subcommand for upload directory
+- [ ] bash/zsh subcommand autocompletion doc
+- [ ] A `put` subcommand for upload directory?
 - [ ] File locking?
