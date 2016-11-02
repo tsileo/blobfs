@@ -1,12 +1,12 @@
 package cache
 
 import (
+	"os"
 	"path/filepath"
-	"sync"
 
 	"golang.org/x/net/context"
 
-	"github.com/tsileo/blobstash/pkg/backend/blobsfile"
+	localblobstore "github.com/tsileo/blobfs/pkg/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/clientutil"
 	"github.com/tsileo/blobstash/pkg/config/pathutil"
@@ -16,30 +16,35 @@ import (
 // TODO(tsileo): add Clean/Reset/Remove methods
 
 type Cache struct {
-	backend *blobsfile.BlobsFileBackend
-	bs      *blobstore.BlobStore
-	kv      *vkv.DB
-	wg      sync.WaitGroup
+	lbs *localblobstore.BlobStore
+	bs  *blobstore.BlobStore // Remote BlobStore client for BlobStash
+	kv  *vkv.DB
 	// TODO(tsileo): embed a kvstore too (but witouth sync/), may be make it optional?
 }
 
-func New(opts *clientutil.Opts, name string) *Cache {
-	wg := sync.WaitGroup{}
-	backend := blobsfile.New(filepath.Join(pathutil.VarDir(), name), 0, false, wg)
-	kv, err := vkv.New(filepath.Join(pathutil.VarDir(), name, "vkv"))
+// TODO(tsileo): return (*Cache, error)
+func New(opts *clientutil.Opts, name string) (*Cache, error) {
+	path := filepath.Join(pathutil.VarDir(), name)
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return nil, err
+	}
+	kv, err := vkv.New(filepath.Join(path, "kv"))
 	if err != nil {
-		panic(err)
+		return nil, err
+	}
+	lbs, err := localblobstore.New("", name)
+	if err != nil {
+		return nil, err
 	}
 	return &Cache{
-		kv:      kv,
-		bs:      blobstore.New(opts),
-		backend: backend,
-		wg:      wg,
-	}
+		kv:  kv,
+		bs:  blobstore.New(opts),
+		lbs: lbs,
+	}, nil
 }
 
 func (c *Cache) Close() error {
-	c.backend.Close()
+	c.lbs.Close()
 	return c.kv.Close()
 }
 
@@ -56,7 +61,7 @@ func (c *Cache) PutRemote(hash string, blob []byte) error {
 }
 
 func (c *Cache) Put(hash string, blob []byte) error {
-	return c.backend.Put(hash, blob)
+	return c.lbs.Put(hash, blob)
 }
 
 func (c *Cache) StatRemote(hash string) (bool, error) {
@@ -64,7 +69,7 @@ func (c *Cache) StatRemote(hash string) (bool, error) {
 }
 
 func (c *Cache) Stat(hash string) (bool, error) {
-	exists, err := c.backend.Stat(hash)
+	exists, err := c.lbs.Stat(hash)
 	if err != nil {
 		return false, err
 	}
@@ -75,7 +80,7 @@ func (c *Cache) Stat(hash string) (bool, error) {
 }
 
 func (c *Cache) Get(ctx context.Context, hash string) ([]byte, error) {
-	blob, err := c.backend.Get(hash)
+	blob, err := c.lbs.Get(hash)
 	switch err {
 	// If the blob is not found locally, try to fetch it from the remote blobstore
 	case clientutil.ErrBlobNotFound:
@@ -84,7 +89,7 @@ func (c *Cache) Get(ctx context.Context, hash string) ([]byte, error) {
 			return nil, err
 		}
 		// Save the blob locally for future fetch
-		if err := c.backend.Put(hash, blob); err != nil {
+		if err := c.lbs.Put(hash, blob); err != nil {
 			return nil, err
 		}
 	case nil:
