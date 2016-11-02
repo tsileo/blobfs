@@ -25,7 +25,7 @@ import (
 	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/kvstore"
-	"github.com/tsileo/blobstash/pkg/config/pathutil"
+	_ "github.com/tsileo/blobstash/pkg/config/pathutil"
 	"github.com/tsileo/blobstash/pkg/filetree/filetreeutil/meta"
 	"github.com/tsileo/blobstash/pkg/filetree/reader/filereader"
 	"github.com/tsileo/blobstash/pkg/filetree/writer"
@@ -452,7 +452,11 @@ func main() {
 	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
 	bsOpts := blobstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
 	bsOpts.SnappyCompression = false
-	bs := cache.New(bsOpts, fmt.Sprintf("blobfs_cache_%s", name))
+	bs, err := cache.New(bsOpts, fmt.Sprintf("blobfs_cache_%s", name))
+	if err != nil {
+		fslog.Crit("failed to init cache", "err", err)
+		os.Exit(1)
+	}
 	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
 	kvsOpts.SnappyCompression = false
 	kvs := kvstore.New(kvsOpts)
@@ -469,26 +473,28 @@ func main() {
 		fslog.Crit("failed to mount", "err", err)
 		os.Exit(1)
 	}
-	kv, err := vkv.New(filepath.Join(pathutil.VarDir(), "blobsfs", name, "lkv"))
-	defer kv.Close()
-	if err != nil {
-		panic(err)
-	}
+
+	// TODO(tsileo): switch to this kv
+	// kv, err := vkv.New(filepath.Join(pathutil.VarDir(), "blobsfs", name, "lkv"))
+	// defer kv.Close()
+	// if err != nil {
+	// 	panic(err)
+	// }
 
 	bfs = &FS{
 		log:        fslog,
 		socketPath: sockPath,
 		name:       name,
 		bs:         bs,
-		lkv:        kv,
-		kvs:        kvs,
-		uploader:   writer.NewUploader(bs),
-		immutable:  *immutablePtr,
-		host:       bsOpts.Host,
-		sync:       make(chan struct{}),
-		latest:     &Mount{},
-		staging:    &Mount{}, // TODO(tsileo): remove staging
-		mount:      &Mount{},
+		// lkv:        kv,
+		kvs:       kvs,
+		uploader:  writer.NewUploader(bs),
+		immutable: *immutablePtr,
+		host:      bsOpts.Host,
+		sync:      make(chan struct{}),
+		latest:    &Mount{},
+		staging:   &Mount{}, // TODO(tsileo): remove staging
+		mount:     &Mount{},
 	}
 
 	go func() {
@@ -719,7 +725,7 @@ func newDebugFile(data string) *debugFile {
 }
 
 func (f *debugFile) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = 2
+	a.Inode = 0
 	a.Mode = 0444
 	a.Size = uint64(len(f.data))
 	return nil
@@ -1073,7 +1079,11 @@ func (d *Dir) reload() error {
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	d.log.Debug("OP Attr")
-	a.Inode = 1
+	if d.parent == nil {
+		a.Inode = 2
+	} else {
+		a.Inode = 0
+	}
 	a.Mode = os.ModeDir | 0555
 	return nil
 }
@@ -1275,13 +1285,13 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		switch node := c.(type) {
 		case *Dir:
 			dirs = append(dirs, fuse.Dirent{
-				Inode: 1, // FIXME(tsileo): Generate Inode everywhere
+				Inode: 0,
 				Name:  node.meta.Name,
 				Type:  fuse.DT_Dir,
 			})
 		case *File:
 			dirs = append(dirs, fuse.Dirent{
-				Inode: 2,
+				Inode: 0,
 				Name:  node.Meta.Name,
 				Type:  fuse.DT_File,
 			})
@@ -1723,7 +1733,7 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.log.Debug("OP Attr")
 	defer f.log.Debug("OP Attr END")
-	a.Inode = 2
+	a.Inode = 0
 	a.Mode = os.FileMode(f.Meta.Mode)
 	a.Size = uint64(f.Meta.Size)
 	if f.Meta.ModTime != "" {

@@ -189,7 +189,7 @@ func main() {
 			panic(err)
 		}
 		fmt.Printf("%s\n", burl)
-		fmt.Printf("\nYou still need to commit for the file to become available.")
+		fmt.Printf("\nYou still need to make a sync for the file to become available.")
 
 	case "unshare":
 		path := "."
