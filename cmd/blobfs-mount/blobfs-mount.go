@@ -34,6 +34,9 @@ import (
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
+// FIXME(tsileo): moving to an unexisting directory make the process hang?
+// TODO(tsileo): use fs func for invalidating kernel cache
+
 const maxInt = int(^uint(0) >> 1)
 
 var virtualXAttrs = map[string]func(*meta.Meta) []byte{
@@ -422,7 +425,7 @@ func main() {
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		for _ = range t.C {
-			fslog.Info(fmt.Sprintf("latest=%+v,staging=%+v,mount=%+v", bfs.latest, bfs.staging, bfs.mount))
+			// fslog.Info(fmt.Sprintf("latest=%+v,staging=%+v,mount=%+v", bfs.latest, bfs.staging, bfs.mount))
 			if stats.updated {
 				fslog.Info(stats.String())
 				fslog.Debug("Flushing stats")
@@ -430,13 +433,14 @@ func main() {
 			}
 		}
 	}()
-	go func() {
-		t := time.NewTicker(10 * time.Minute)
-		for _ = range t.C {
-			fslog.Debug("trigger sync")
-			bfs.sync <- struct{}{}
-		}
-	}()
+	// FIXME(tsileo): re-enable, and do the update only if it's been 10 minutes without any activity
+	// go func() {
+	// 	t := time.NewTicker(10 * time.Minute)
+	// 	for _ = range t.C {
+	// 		fslog.Debug("trigger sync")
+	// 		bfs.sync <- struct{}{}
+	// 	}
+	// }()
 
 	sockPath := fmt.Sprintf("/tmp/blobfs_%s.sock", name)
 
@@ -657,7 +661,6 @@ func main() {
 
 		// check if the mount process has an error to report
 		<-c.Ready
-		fslog.Debug("ready")
 		if err := c.MountError; err != nil {
 			fslog.Crit("mount error", "err", err)
 			os.Exit(1)
@@ -1219,29 +1222,27 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		if err := d.fs.uploader.RenameMeta(meta, req.NewName); err != nil {
 			return err
 		}
-		d.mu.Lock()
-		defer d.mu.Unlock()
 		// Delete the source
+		d.mu.Lock()
 		delete(d.Children, req.OldName)
-		if err := d.save(false); err != nil {
-			return err
-		}
+		d.mu.Unlock()
+
 		ndir := newDir.(*Dir)
 		if d != ndir {
 			ndir.mu.Lock()
-			defer ndir.mu.Unlock()
+			ndir.Children[req.NewName] = node
+			ndir.mu.Unlock()
+		} else {
+			d.Children[req.NewName] = node
 		}
-		ndir.Children[req.NewName] = node
-		switch n := node.(type) {
-		case *Dir:
-			n.Name = req.NewName
-			n.meta = node.(*Dir).meta
-		case *File:
-			n.Meta = node.(*File).Meta
-		}
-		ndir.Children[req.NewName] = node
-		if err := ndir.save(false); err != nil {
+
+		if err := d.save(false); err != nil {
 			return err
+		}
+		if d != ndir {
+			if err := ndir.save(false); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -1312,6 +1313,10 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		if err := d.reload(); err != nil {
 			return nil, err
 		}
+	}
+
+	if _, ok := d.Children[req.Name]; ok {
+		return nil, fuse.EEXIST
 	}
 
 	newdir := &Dir{
