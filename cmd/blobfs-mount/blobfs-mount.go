@@ -36,6 +36,8 @@ import (
 
 // FIXME(tsileo): moving to an unexisting directory make the process hang?
 // TODO(tsileo): use fs func for invalidating kernel cache
+// TODO(tsileo): don't use defer for dir Mutex
+// TODO(tsileo): no more name in Dir/File, read it from the meta
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -1026,6 +1028,13 @@ func (f *FS) loadRoot2() (fs.Node, error) {
 	}
 	f.log.Info("initial load", "mount", f.mount, "latest", f.latest, "staging", f.staging)
 	return f.mount.root, nil
+}
+
+// FIXME(tsileo): make Dir and File implement Node
+type Node interface {
+	Meta() *meta.Meta
+	SetMeta(*meta.Meta)
+	Save() error
 }
 
 // Dir implements both Node and Handle for the root directory.

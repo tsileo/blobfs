@@ -1,4 +1,9 @@
 # coding: utf-8
+"""Test suite for BlobFS.
+
+A custom test suite allows the tests for be written at the same as new features.
+A proper POSIX test suite may be added later once more features/calls are implemented.
+"""
 import os
 import random
 import string
@@ -8,7 +13,11 @@ import shutil
 from subprocess import Popen, PIPE, check_output
 
 PATH = os.path.dirname(os.path.realpath(__file__))
-FILE_SIZE = 5 * 2 ** 20  # 5MB file by default
+FILE_SIZE = 3 * 2 ** 20  # 3MB file by default
+
+# TODO(tsileo): test `blobfs` checkout, log
+# TODO(tsileo): use pytest with custom error?
+# TODO(tsileo): test that we can read the `.blobfs_socket` file
 
 
 def random_name(l=10):
@@ -193,6 +202,7 @@ try:
     f2.read_and_check()
 
 
+    # TODO(tsileo): enable this on console flag to "test" new test more easily
     # from IPython import embed; embed()
 
 finally:
