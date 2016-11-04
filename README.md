@@ -1,11 +1,10 @@
 # BlobFS
 
-A FUSE file system built on top of [BlobStash](https://github.com/tsileo/blobstash) with a taste of content versioning.
+A FUSE file system built on top of [BlobStash](https://github.com/tsileo/blobstash) with built-in sync and deduplication.
 
 ## Features
 
  - Content addressed (with BLAKE2b as hashing algorithm), files are split into blobs, and retrieved by hash, blobs are deduplicated (incremental backups by default).
- - You choose when to **commit** changes, with basic CVS features.
  - **checkout** old versions as immutable snapshot
  - Easily share entire directories or single files through BlobStash
 
@@ -22,20 +21,6 @@ Usage of blobfs-mount:
 ```console
 $ mkdir ~/docs
 $ blobfs-mount documents ~/docs
-$ cd ~/docs
-$ touch newdoc
-$ blobfs -comment "added new doc" commit
-$ blobfs log
-$ ls
-newdoc
-$ touch newnewdoc
-$ blobfs -comment "added new new doc" commit
-$ blobfs log
-$ ls
-newdoc newnewdoc
-$ blobfs checkout aef...
-$ ls
-newdoc
 ```
 
 ## TODOs
