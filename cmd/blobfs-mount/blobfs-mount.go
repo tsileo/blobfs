@@ -230,16 +230,6 @@ func iterDir(dir *Dir, cb func(n Node) error) error {
 				return err
 			}
 		}
-		switch n := node.(type) {
-		case *File:
-			if err := cb(n); err != nil {
-				return err
-			}
-		case *Dir:
-			if err := iterDir(n, cb); err != nil {
-				return err
-			}
-		}
 	}
 	return cb(dir)
 }
