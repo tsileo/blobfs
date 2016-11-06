@@ -1268,6 +1268,8 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if err := d.Save(); err != nil {
 		return nil, nil, err
 	}
+	f.state.openCount++
+	f.log.Debug("new openCount", "count", f.state.openCount)
 	stats.Lock()
 	stats.updated = true
 	stats.FilesCreated++
@@ -1276,7 +1278,8 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 }
 
 type fileState struct {
-	updated bool
+	updated   bool
+	openCount int
 }
 
 type File struct {
@@ -1345,36 +1348,8 @@ func (*ClosingBuffer) Close() error {
 }
 
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.log.Debug("OP Flush")
 	defer f.log.Debug("OP Flush END")
-	if f.fs.Immutable() {
-		return nil
-	}
-	if !f.state.updated {
-		return nil
-	}
-	f.meta.Size = len(f.data)
-	if f.data != nil && len(f.data) > 0 {
-		// XXX(tsileo): data will be saved once the tree will be synced
-		buf := bytes.NewBuffer(f.data)
-		m2, err := f.fs.uploader.PutReader(f.meta.Name, &ClosingBuffer{buf})
-		f.log.Debug("new meta", "meta", fmt.Sprintf("%+v", m2))
-		// f.log.Debug("WriteResult", "wr", wr)
-		if err != nil {
-			return err
-		}
-		f.parent.mu.Lock()
-		defer f.parent.mu.Unlock()
-		if err := f.parent.Save(); err != nil {
-			return err
-		}
-		f.meta = m2
-		// f.log = f.log.New("ref", m2.Hash[:10])
-		f.log.Debug("Flushed", "data_len", len(f.data))
-	}
-	f.state.updated = false
 	return nil
 }
 
@@ -1612,34 +1587,68 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
 	f.log.Debug("OP Open")
 	defer f.log.Debug("OP Open END")
-	if (f.data == nil || len(f.data) == 0) && len(f.meta.Refs) > 0 {
+	f.state.openCount++
+	f.log.Debug("open count", "count", f.state.openCount)
+	if f.state.openCount == 1 && len(f.meta.Refs) > 0 {
+		// if (f.data == nil || len(f.data) == 0) && len(f.meta.Refs) > 0 {
 		// if (req.Flags.IsReadOnly() || req.Flags.IsReadWrite()) && !f.state.updated {
-		if !f.fs.Immutable() {
-			f.log.Debug("Open with fakefile")
-			f.FakeFile = filereader.NewFile(f.fs.bs, f.meta)
-			// FIXME(tsileo): only if the buffer is small, or load a temp file?
-			var err error
-			f.data, err = ioutil.ReadAll(f.FakeFile)
-			if err != nil {
-				return nil, err
-			}
+		f.log.Debug("Creating FakeFile")
+		// if !f.fs.Immutable() && f.FakeFile == nil && f.data == nil {
+		// f.log.Debug("Creating FakeFile")
+		f.FakeFile = filereader.NewFile(f.fs.bs, f.meta)
+		// FIXME(tsileo): only if the buffer is small, or load a temp file?
+		var err error
+		f.data, err = ioutil.ReadAll(f.FakeFile)
+		if err != nil {
+			return nil, err
 		}
-		// }
 	}
 	return f, nil
 }
 
 func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	// XXX(tsileo): have a counter of open and only release when it's goes to 0?
 	f.log.Debug("OP Release")
-	defer f.log.Debug("OP Release END")
-	if f.FakeFile != nil {
-		f.FakeFile.Close()
-		f.FakeFile = nil
+	defer func() {
+		f.state.openCount--
+		f.log.Debug("new openCount", "count", f.state.openCount)
+		f.log.Debug("OP Release END")
+		f.mu.Unlock()
+	}()
+
+	if f.fs.Immutable() {
+		return nil
 	}
-	f.data = nil
+	if f.state.openCount == 1 {
+		f.log.Debug("Last file descriptor for this node, cleaning up the FakeFile and data")
+		if f.data != nil && len(f.data) > 0 && f.state.updated {
+			f.meta.Size = len(f.data)
+			// XXX(tsileo): data will be saved once the tree will be synced
+			buf := bytes.NewBuffer(f.data)
+			m2, err := f.fs.uploader.PutReader(f.meta.Name, &ClosingBuffer{buf})
+			f.log.Debug("new meta", "meta", fmt.Sprintf("%+v", m2))
+			// f.log.Debug("WriteResult", "wr", wr)
+			if err != nil {
+				return err
+			}
+			f.parent.mu.Lock()
+			defer f.parent.mu.Unlock()
+			if err := f.parent.Save(); err != nil {
+				return err
+			}
+			f.meta = m2
+			// f.log = f.log.New("ref", m2.Hash[:10])
+			f.log.Debug("Flushed", "data_len", len(f.data))
+			f.state.updated = false
+		}
+		// This is the last file descriptor, we can clean everything
+		if f.FakeFile != nil {
+			f.FakeFile.Close()
+			f.FakeFile = nil
+		}
+		f.data = nil
+	}
 	return nil
 }
 
@@ -1654,6 +1663,9 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 	defer f.mu.Unlock()
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
 	defer f.log.Debug("OP Read END", "offset", req.Offset, "size", req.Size)
+	if f.data == nil && f.FakeFile == nil {
+		return nil
+	}
 	if req.Offset >= int64(f.meta.Size) {
 		return nil
 	}

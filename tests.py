@@ -196,6 +196,10 @@ try:
             print f3ro_content, f3_content
             assert f3ro_content == f3_content
 
+        f3.write(f3_content)
+
+    with open(os.path.join(mnt, f3_name)) as f3:
+        assert f3.read() == f3_content * 2
 
     d1 = root_dir.create_dir()
 
@@ -227,7 +231,7 @@ try:
 
 
     # TODO(tsileo): enable this on console flag to "test" new test more easily
-    # from IPython import embed; embed()
+    from IPython import embed; embed()
 
 finally:
     blobfs.unmount()
