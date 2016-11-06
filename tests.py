@@ -231,7 +231,7 @@ try:
 
 
     # TODO(tsileo): enable this on console flag to "test" new test more easily
-    from IPython import embed; embed()
+    # from IPython import embed; embed()
 
 finally:
     blobfs.unmount()

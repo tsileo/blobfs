@@ -1015,13 +1015,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	}
 
 	if node, ok := d.Children[req.OldName]; ok {
-		var meta *meta.Meta
-		switch node.(type) {
-		case *Dir:
-			meta = node.(*Dir).meta
-		case *File:
-			meta = node.(*File).meta
-		}
+		meta := node.Meta()
 		if err := d.fs.uploader.RenameMeta(meta, req.NewName); err != nil {
 			return err
 		}
@@ -1617,12 +1611,9 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 		f.mu.Unlock()
 	}()
 
-	if f.fs.Immutable() {
-		return nil
-	}
 	if f.state.openCount == 1 {
 		f.log.Debug("Last file descriptor for this node, cleaning up the FakeFile and data")
-		if f.data != nil && len(f.data) > 0 && f.state.updated {
+		if !f.fs.Immutable() && f.data != nil && len(f.data) > 0 && f.state.updated {
 			f.meta.Size = len(f.data)
 			// XXX(tsileo): data will be saved once the tree will be synced
 			buf := bytes.NewBuffer(f.data)
