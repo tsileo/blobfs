@@ -179,15 +179,39 @@ try:
 
     f1.read_and_check()
 
+    # Edit the file
+    f1.edit()
+
+    f1.read_and_check()
+
+    f3_name = random_name()
+    f3_content = 'testing'
+    with open(os.path.join(mnt, f3_name), 'wb+') as f3:
+        f3.write(f3_content)
+        f3.flush()
+
+        # Ensure we can see the content after the flush if we open the file again
+        with open(os.path.join(mnt, f3_name)) as f3ro:
+            f3ro_content = f3ro.read()
+            print f3ro_content, f3_content
+            assert f3ro_content == f3_content
+
+
     d1 = root_dir.create_dir()
 
-    assert len(root_dir.list()) == 2
+    # Ensure the file is created
+    assert len(root_dir.list()) == 3
 
     # Check that we get EEXIST (17) error when creating a file that already exists
+    eraised = False
     try:
         root_dir.create_dir(name=d1.basename)
     except OSError as exc:
+        eraised = True
         assert exc.errno == 17
+
+    assert eraised
+
 
     f2 = d1.create_file()
 

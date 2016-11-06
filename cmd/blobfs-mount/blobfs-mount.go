@@ -22,7 +22,7 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	_ "bazil.org/fuse/fuseutil"
+	"bazil.org/fuse/fuseutil"
 	"github.com/tsileo/blobfs/pkg/cache"
 	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
@@ -1316,12 +1316,12 @@ func (f *File) Unlock() { f.mu.Unlock() }
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.state.updated = true
 	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
 	defer f.log.Debug("OP Write END", "offset", req.Offset, "size", len(req.Data))
 	if f.fs.Immutable() {
 		return fuse.EPERM
 	}
+	f.state.updated = true
 	newLen := req.Offset + int64(len(req.Data))
 	if newLen > int64(maxInt) {
 		return fuse.Errno(syscall.EFBIG)
@@ -1383,6 +1383,10 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.fs.Immutable() {
+		return nil
+	}
+
 	// Prevent writing attributes name that are virtual attributes
 	if _, exists := virtualXAttrs[req.Name]; exists {
 		return nil
@@ -1404,6 +1408,11 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 }
 
 func (f *File) Save() error {
+	if f.fs.Immutable() {
+		f.log.Warn("Trying to save an immutable node")
+		return nil
+	}
+
 	// Update the new `Meta`
 	f.parent.fs.uploader.PutMeta(f.meta)
 	// And save the parent
@@ -1536,7 +1545,11 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = os.FileMode(f.meta.Mode)
 	a.Uid = f.fs.uid
 	a.Gid = f.fs.gid
-	a.Size = uint64(f.meta.Size)
+	if f.fs.Immutable() || f.data == nil {
+		a.Size = uint64(f.meta.Size)
+	} else {
+		a.Size = uint64(len(f.data))
+	}
 	if f.meta.ModTime != "" {
 		t, err := time.Parse(time.RFC3339, f.meta.ModTime)
 		if err != nil {
@@ -1600,7 +1613,8 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 	f.log.Debug("OP Open")
 	defer f.log.Debug("OP Open END")
 	if (f.data == nil || len(f.data) == 0) && len(f.meta.Refs) > 0 {
-		if req.Flags.IsReadOnly() || req.Flags.IsReadWrite() {
+		// if (req.Flags.IsReadOnly() || req.Flags.IsReadWrite()) && !f.state.updated {
+		if !f.fs.Immutable() {
 			f.log.Debug("Open with fakefile")
 			f.FakeFile = filereader.NewFile(f.fs.bs, f.meta)
 			// FIXME(tsileo): only if the buffer is small, or load a temp file?
@@ -1610,6 +1624,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 				return nil, err
 			}
 		}
+		// }
 	}
 	return f, nil
 }
@@ -1617,6 +1632,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// XXX(tsileo): have a counter of open and only release when it's goes to 0?
 	f.log.Debug("OP Release")
 	defer f.log.Debug("OP Release END")
 	if f.FakeFile != nil {
@@ -1629,6 +1645,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	f.log.Debug("OP Fsync")
+	// XXX(tsileo): flush the file?
 	return nil
 }
 
@@ -1637,25 +1654,24 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 	defer f.mu.Unlock()
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
 	defer f.log.Debug("OP Read END", "offset", req.Offset, "size", req.Size)
-	// if f.data != nil && f.Meta.Size != len(f.data) {
-	// 	fuseutil.HandleRead(req, res, f.data)
-	// 	return nil
-	// }
-	// if f.FakeFile != nil {
 	if req.Offset >= int64(f.meta.Size) {
 		return nil
 	}
-	buf := make([]byte, req.Size)
-	n, err := f.FakeFile.ReadAt(buf, req.Offset)
-	if err == io.EOF {
-		err = nil
+	if f.fs.Immutable() {
+		f.log.Debug("Reading from FakeFile")
+		buf := make([]byte, req.Size)
+		n, err := f.FakeFile.ReadAt(buf, req.Offset)
+		if err == io.EOF {
+			err = nil
+		}
+		if err != nil {
+			return fuse.EIO
+		}
+		res.Data = buf[:n]
+		return nil
 	}
-	if err != nil {
-		return fuse.EIO
-	}
-	res.Data = buf[:n]
+
+	f.log.Debug("Reading from memory")
+	fuseutil.HandleRead(req, res, f.data)
 	return nil
-	// }
-	// fuseutil.HandleRead(req, res, f.data)
-	// return nil
 }
