@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	_ "path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -184,17 +186,6 @@ func apiLogHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := []*CommitLog{}
-	if !bfs.staging.Empty() && bfs.staging.ref != bfs.latest.ref {
-		cl := &CommitLog{
-			Ref:     "STAGING",
-			Comment: "",
-			T:       "",
-		}
-		if bfs.mount.ref == bfs.staging.ref {
-			cl.Current = true
-		}
-		out = append(out, cl)
-	}
 
 	versions, err := bfs.kvs.Versions(fmt.Sprintf(rootKeyFmt, bfs.name), 0, -1, 0)
 	switch err {
@@ -370,12 +361,27 @@ func main() {
 	// if err != nil {
 	// 	panic(err)
 	// }
+	cuser, err := user.Current()
+	if err != nil {
+		fslog.Crit("failed to get current user", "err", err)
+		os.Exit(1)
+	}
+	iuid, err := strconv.Atoi(cuser.Uid)
+	if err != nil {
+		panic(err)
+	}
+	igid, err := strconv.Atoi(cuser.Gid)
+	if err != nil {
+		panic(err)
+	}
 
 	bfs = &FS{
 		log:        fslog,
 		socketPath: sockPath,
 		name:       name,
 		bs:         bs,
+		uid:        uint32(iuid),
+		gid:        uint32(igid),
 		// lkv:        kv,
 		kvs:       kvs,
 		uploader:  writer.NewUploader(bs),
@@ -383,152 +389,139 @@ func main() {
 		host:      bsOpts.Host,
 		sync:      make(chan struct{}),
 		latest:    &Mount{},
-		staging:   &Mount{}, // TODO(tsileo): remove staging
 		mount:     &Mount{},
 	}
 
 	go func() {
 		for {
-			sync := func() {
+			sync := func() ([]string, error) {
 				wg.Add(1)
 				defer wg.Done()
 				l := fslog.New("module", "sync")
 				l.Debug("Sync triggered")
+				refs := []string{}
 
 				// XXX(tsileo): a getRoot to DRY?
-				rroot, _ := getLatestRemoteRoot()
+				// rroot, _ := getLatestRemoteRoot()
 
-				if err != kvstore.ErrKeyNotFound {
-					l.Error("failed to fetch latest remote vkv entry", "err", err)
-					return
-				}
+				// if err != kvstore.ErrKeyNotFound {
+				// l.Error("failed to fetch latest remote vkv entry", "err", err)
+				// return
+				// }
 				// // FIXME(tsileo): a way to output the sync status to the HTTP handler
 				// like: "already in sync"/"synced"/"conflict"
-				if rroot != nil && rroot.Ref != bfs.latest.ref {
-					l.Error("conflicted tree")
-					// FIXME(tsileo): return a conflicted status
-					return
-				}
+				// if rroot != nil && rroot.Ref != bfs.latest.ref {
+				// 	l.Error("conflicted tree")
+				// 	// FIXME(tsileo): return a conflicted status
+				// 	return
+				// }
 
 				// Keep some basic stats about the on-going sync
 				stats := &SyncStats{}
 
 				if bfs == nil {
 					l.Debug("bfs is nil")
-					return
+					return nil, nil
 				}
+
 				bfs.mu.Lock()
 				defer func() {
 					l.Info("Sync done", "blobs_uploaded", stats.BlobsUploaded, "blobs_skipped", stats.BlobsSkipped)
 					bfs.mu.Unlock()
 				}()
-				kv, err := bfs.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
-				if err != nil {
-					l.Error("Sync failed (failed to fetch the local vkv entry)", "err", err)
-					return
-				}
-				l.Debug("last sync info", "current version", kv.Version, "lastRootVersion", bfs.lastRootVersion)
-				if kv.Version == bfs.lastRootVersion {
-					l.Info("Already in sync")
-					return
-				}
-				rkv, err := bfs.kvs.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
-				if err != nil {
-					if err != kvstore.ErrKeyNotFound {
-						l.Error("Sync failed (failed to fetch the remote vkv entry)", "err", err)
-						return
-					}
-				}
 
-				if rkv != nil && rkv.Version == kv.Version {
-					l.Info("Already in sync")
-					return
-				}
+				// kv, err := bfs.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+				// if err != nil {
+				// 	l.Error("Sync failed (failed to fetch the local vkv entry)", "err", err)
+				// 	return
+				// }
+				// l.Debug("last sync info", "current version", kv.Version, "lastRootVersion", bfs.lastRootVersion)
+				// if kv.Version == bfs.lastRootVersion {
+				// 	l.Info("Already in sync")
+				// 	return
+				// }
+				// rkv, err := bfs.kvs.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+				// if err != nil {
+				// 	if err != kvstore.ErrKeyNotFound {
+				// 		l.Error("Sync failed (failed to fetch the remote vkv entry)", "err", err)
+				// 		return
+				// 	}
+				// }
+
+				// if rkv != nil && rkv.Version == kv.Version {
+				// 	l.Info("Already in sync")
+				// 	return
+				// }
 
 				oroot, err := bfs.Root()
 				if err != nil {
 					l.Error("Failed to fetch root", "err", err)
-					return
+					return nil, err
 				}
 				rootDir := oroot.(*Dir)
 				// putBlob will try to upload all missing blobs to the remote BlobStash instance
-				putBlob := func(l log15.Logger, hash string, blob []byte) error {
-					mexists, err := bfs.bs.StatRemote(hash)
-					if err != nil {
-						l.Error("stat failed", "err", err)
-						return err
-					}
-					if mexists {
-						stats.BlobsSkipped++
-					} else {
-						// Fetch the blob locally via the cache if needed
-						if blob == nil {
-							blob, err = bfs.bs.Get(context.TODO(), hash)
-							if err != nil {
-								return err
-							}
+				// putBlob := func(l log15.Logger, hash string, blob []byte) error {
+				// 	mexists, err := bfs.bs.StatRemote(hash)
+				// 	if err != nil {
+				// 		l.Error("stat failed", "err", err)
+				// 		return err
+				// 	}
+				// 	if mexists {
+				// 		stats.BlobsSkipped++
+				// 	} else {
+				// 		// Fetch the blob locally via the cache if needed
+				// 		if blob == nil {
+				// 			blob, err = bfs.bs.Get(context.TODO(), hash)
+				// 			if err != nil {
+				// 				return err
+				// 			}
 
-						}
-						l.Debug("Uploading blob", "hash", hash)
-						if err := bfs.bs.PutRemote(hash, blob); err != nil {
-							l.Error("put failed", "err", err)
-							return err
-						}
-						stats.BlobsUploaded++
-					}
-					return nil
-				}
+				// 		}
+				// 		l.Debug("Uploading blob", "hash", hash)
+				// 		if err := bfs.bs.PutRemote(hash, blob); err != nil {
+				// 			l.Error("put failed", "err", err)
+				// 			return err
+				// 		}
+				// 		stats.BlobsUploaded++
+				// 	}
+				// 	return nil
+				// }
 				if err := iterDir(rootDir, func(node Node) error {
-					switch n := node.(type) {
-					case *File:
-						// n.mu.Lock()
-						// defer n.mu.Lock()
-						// Save the meta
-						mhash, mjs := n.meta.Json()
-						if putBlob(n.log, mhash, mjs); err != nil {
-							return err
-						}
-						// Save all the parts of the file
-						for _, m := range n.meta.Refs {
-							data := m.([]interface{})
-							hash := data[1].(string)
-							if err := putBlob(n.log, hash, nil); err != nil {
-								return err
-							}
-						}
-					case *Dir:
-						// TODO(tsileo): fix the locking here and above
-						// n.mu.Lock()
-						// defer n.mu.Lock()
-						mhash, mjs := n.meta.Json()
-						if putBlob(n.log, mhash, mjs); err != nil {
-							return err
+					ref := node.Meta().Hash
+					refs = append(refs, ref)
+					if !node.IsDir() {
+						for _, iref := range node.Meta().Refs {
+							data := iref.([]interface{})
+							ref := data[1].(string)
+							refs = append(refs, ref)
 						}
 					}
 					return nil
 				}); err != nil {
 					l.Error("iterDir failed", "err", err)
-					return
+					return nil, err
 				}
-				bfs.lastRootVersion = kv.Version
+				// bfs.lastRootVersion = kv.Version
 				// Save the vkv entry in the remote vkv API
-				newRoot := &root.Root{}
-				if err := json.Unmarshal([]byte(kv.Data), newRoot); err != nil {
-					return
-				}
+				// newRoot := &root.Root{}
+				// if err := json.Unmarshal([]byte(kv.Data), newRoot); err != nil {
+				// return
+				// }
 				// XXX(tsileo: log the host?
 				// newRoot.Comment = sr.Comment
-				newValue, err := json.Marshal(newRoot)
-				if err != nil {
-					return
-				}
-				if _, err := bfs.kvs.Put(kv.Key, "", newValue, kv.Version); err != nil {
-					l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
-					return
-				}
+				// newValue, err := json.Marshal(newRoot)
+				// if err != nil {
+				// 	return
+				// }
+				// if _, err := bfs.kvs.Put(kv.Key, "", newValue, kv.Version); err != nil {
+				// 	l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
+				// 	return
+				// }
 				// bfs.latest.ref = newRoot.Ref
 				// bfs.latest.root = rootDir
+				return refs, nil
 			}
+
 			select {
 			case <-bfs.sync:
 				fslog.Info("Sync triggered")
@@ -640,8 +633,9 @@ type FS struct {
 	lastWrite       time.Time
 	root            fs.Node
 	mount           *Mount
-	staging         *Mount
 	latest          *Mount
+	uid             uint32
+	gid             uint32
 }
 
 type Mount struct {
@@ -773,9 +767,9 @@ func (f *FS) loadRoot() (fs.Node, error) {
 		}
 		remoteRoot = d
 		cmount := &Mount{immutable: f.immutable, root: d, ref: m.Hash}
-		if f.staging.ref != "" {
-			f.mount = cmount
-		}
+		// if f.staging.ref != "" {
+		// 	f.mount = cmount
+		// }
 		cmount.Copy(f.latest)
 		// return d, nil
 	case kvstore.ErrKeyNotFound:
@@ -819,7 +813,7 @@ func (f *FS) loadRoot() (fs.Node, error) {
 	case newRoot != nil:
 		rootNode = newRoot
 	}
-	f.log.Info("initial load", "mount", f.mount, "latest", f.latest, "staging", f.staging)
+	f.log.Info("initial load", "mount", f.mount)
 	f.mount = &Mount{immutable: f.immutable, root: rootNode, ref: rootNode.meta.Hash}
 	f.mount.Copy(f.latest)
 	return f.mount.root, nil
@@ -831,6 +825,8 @@ type Node interface {
 	SetMeta(*meta.Meta)
 	Save() error
 	IsDir() bool
+	Lock()
+	Unlock()
 }
 
 // Dir implements both Node and Handle for the root directory.
@@ -884,6 +880,10 @@ func (d *Dir) reload() error {
 	return nil
 }
 
+func (d *Dir) Lock() { d.mu.Lock() }
+
+func (d *Dir) Unlock() { d.mu.Unlock() }
+
 func (d *Dir) IsDir() bool { return true }
 
 func (d *Dir) Meta() *meta.Meta { return d.meta }
@@ -900,6 +900,8 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 		a.Inode = 0
 	}
 	a.Mode = os.ModeDir | 0555
+	a.Uid = d.fs.uid
+	a.Gid = d.fs.gid
 	return nil
 }
 
@@ -1208,9 +1210,8 @@ func (d *Dir) Save() error {
 		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), "", js, -1); err != nil {
 			return err
 		}
-		d.fs.staging.ref = mhash
-		d.fs.staging.root = d
-		d.fs.staging.Copy(d.fs.mount)
+		d.fs.mount.ref = mhash
+		d.fs.mount.root = d
 	} else {
 		d.parent.mu.Lock()
 		defer d.parent.mu.Unlock()
@@ -1307,6 +1308,10 @@ func (f *File) Meta() *meta.Meta { return f.meta }
 func (f *File) SetMeta(m *meta.Meta) {
 	f.meta = m
 }
+
+func (f *File) Lock() { f.mu.Lock() }
+
+func (f *File) Unlock() { f.mu.Unlock() }
 
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.mu.Lock()
@@ -1529,6 +1534,8 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	defer f.log.Debug("OP Attr END")
 	a.Inode = 0
 	a.Mode = os.FileMode(f.meta.Mode)
+	a.Uid = f.fs.uid
+	a.Gid = f.fs.gid
 	a.Size = uint64(f.meta.Size)
 	if f.meta.ModTime != "" {
 		t, err := time.Parse(time.RFC3339, f.meta.ModTime)
