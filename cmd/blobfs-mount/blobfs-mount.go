@@ -1498,6 +1498,14 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 	return fuse.ErrNoXattr
 }
 
+func (f *File) Size() int {
+	if f.fs.Immutable() || f.data == nil {
+		return f.meta.Size
+	} else {
+		return len(f.data)
+	}
+}
+
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.log.Debug("OP Attr")
 	defer f.log.Debug("OP Attr END")
@@ -1505,11 +1513,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = os.FileMode(f.meta.Mode)
 	a.Uid = f.fs.uid
 	a.Gid = f.fs.gid
-	if f.fs.Immutable() || f.data == nil {
-		a.Size = uint64(f.meta.Size)
-	} else {
-		a.Size = uint64(len(f.data))
-	}
+	a.Size = uint64(f.Size())
 	if f.meta.ModTime != "" {
 		t, err := time.Parse(time.RFC3339, f.meta.ModTime)
 		if err != nil {
@@ -1649,7 +1653,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 		f.log.Debug("Aborting, data or FakeFile is nil")
 		return nil
 	}
-	if req.Offset >= int64(f.meta.Size) {
+	if req.Offset >= int64(f.Size()) {
 		f.log.Debug("Aborting, out of boundaries offset")
 		return nil
 	}
