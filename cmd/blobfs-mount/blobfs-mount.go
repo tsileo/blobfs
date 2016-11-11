@@ -811,8 +811,6 @@ type Node interface {
 	SetMeta(*meta.Meta)
 	Save() error
 	IsDir() bool
-	Lock()
-	Unlock()
 }
 
 // Dir implements both Node and Handle for the root directory.
@@ -822,7 +820,6 @@ type Dir struct {
 	parent   *Dir
 	Children map[string]Node
 	log      log15.Logger
-	mu       sync.Mutex
 }
 
 func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
@@ -866,10 +863,6 @@ func (d *Dir) reload() error {
 	return nil
 }
 
-func (d *Dir) Lock() { d.mu.Lock() }
-
-func (d *Dir) Unlock() { d.mu.Unlock() }
-
 func (d *Dir) IsDir() bool { return true }
 
 func (d *Dir) Meta() *meta.Meta { return d.meta }
@@ -879,6 +872,8 @@ func (d *Dir) SetMeta(m *meta.Meta) {
 }
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 	d.log.Debug("OP Attr")
 	if d.parent == nil {
 		a.Inode = 2
@@ -913,8 +908,10 @@ func makePublic(node Node, value string) error {
 
 func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	d.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
+	// d.mu.Lock()
+	// defer d.mu.Unlock()
 
 	// If the request is to make the dir public, make it recursively
 	if req.Name == "public" {
@@ -943,8 +940,8 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 
 func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
 	d.log.Debug("OP Removexattr", "name", req.Name)
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 
 	// Can't delete virtual attributes
 	if _, exists := virtualXAttrs[req.Name]; exists {
@@ -978,21 +975,23 @@ func (d *Dir) Forget() {
 
 func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	d.log.Debug("OP Listxattr")
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 	return handleListxattr(d.meta, resp)
 }
 
 func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	d.log.Debug("OP Getxattr", "name", req.Name)
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 	return handleGetxattr(d.fs, d.meta, req, resp)
 }
 
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 
 	if d.Children == nil {
 		if err := d.reload(); err != nil {
@@ -1006,15 +1005,11 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 			return err
 		}
 		// Delete the source
-		d.mu.Lock()
 		delete(d.Children, req.OldName)
-		d.mu.Unlock()
 
 		ndir := newDir.(*Dir)
 		if d != ndir {
-			ndir.mu.Lock()
 			ndir.Children[req.NewName] = node
-			ndir.mu.Unlock()
 		} else {
 			d.Children[req.NewName] = node
 		}
@@ -1035,6 +1030,9 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	d.log.Debug("OP Lookup", "name", name)
 	defer d.log.Debug("OP Lookup END", "name", name)
+
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 
 	// Magic file for returnign the socket path, available in every directory
 	if name == ".blobfs_socket" {
@@ -1057,6 +1055,9 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	d.log.Debug("OP ReadDirAll")
 	defer d.log.Debug("OP ReadDirAll END")
+
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 
 	if d.Children == nil {
 		if err := d.reload(); err != nil {
@@ -1087,6 +1088,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		return nil, fuse.EPERM
 	}
 
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
+
 	if d.Children == nil {
 		if err := d.reload(); err != nil {
 			return nil, err
@@ -1107,8 +1111,6 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	if err := newdir.Save(); err != nil {
 		return nil, err
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.Children[newdir.meta.Name] = newdir
 	if err := d.Save(); err != nil {
 		return nil, err
@@ -1124,13 +1126,14 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 }
 
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.log.Debug("OP Remove", "name", req.Name)
 	defer d.log.Debug("OP Remove END", "name", req.Name)
 	if d.fs.Immutable() {
 		return fuse.EPERM
 	}
+
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
 
 	if d.Children == nil {
 		if err := d.reload(); err != nil {
@@ -1146,6 +1149,8 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	return nil
 }
 
+// Save save all the node recursively bottom to top until the root node is reached
+// Assumes the caller has acquired the lock
 func (d *Dir) Save() error {
 	d.log.Debug("saving")
 	m := meta.NewMeta()
@@ -1198,8 +1203,8 @@ func (d *Dir) Save() error {
 		d.fs.mount.ref = mhash
 		d.fs.mount.root = d
 	} else {
-		d.parent.mu.Lock()
-		defer d.parent.mu.Unlock()
+		// d.parent.mu.Lock()
+		// defer d.parent.mu.Unlock()
 		if err := d.parent.Save(); err != nil {
 			return err
 		}
@@ -1214,8 +1219,9 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		return nil, nil, fuse.EPERM
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.fs.mu.Lock()
+	defer d.fs.mu.Unlock()
+
 	if d.Children == nil {
 		if err := d.reload(); err != nil {
 			return nil, nil, err
@@ -1274,9 +1280,7 @@ type File struct {
 	FakeFile *filereader.File
 	log      log15.Logger
 	parent   *Dir
-
-	state *fileState
-	mu    sync.Mutex
+	state    *fileState
 }
 
 func NewFile(fs *FS, m *meta.Meta, parent *Dir) (*File, error) {
@@ -1297,18 +1301,18 @@ func (f *File) SetMeta(m *meta.Meta) {
 	f.meta = m
 }
 
-func (f *File) Lock() { f.mu.Lock() }
-
-func (f *File) Unlock() { f.mu.Unlock() }
-
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
 	defer f.log.Debug("OP Write END", "offset", req.Offset, "size", len(req.Data))
+
 	if f.fs.Immutable() {
 		return fuse.EPERM
 	}
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
+	// Set the updated flag
 	f.state.updated = true
 	newLen := req.Offset + int64(len(req.Data))
 	if newLen > int64(maxInt) {
@@ -1340,12 +1344,13 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 
 func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	f.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
-	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	if f.fs.Immutable() {
 		return nil
 	}
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	// Prevent writing attributes name that are virtual attributes
 	if _, exists := virtualXAttrs[req.Name]; exists {
@@ -1367,6 +1372,8 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	return nil
 }
 
+// Save will save every node recursively bottom to top until the root is reached.
+// Assumes the FS lock is acquired.
 func (f *File) Save() error {
 	if f.fs.Immutable() {
 		f.log.Warn("Trying to save an immutable node")
@@ -1376,8 +1383,8 @@ func (f *File) Save() error {
 	// Update the new `Meta`
 	f.parent.fs.uploader.PutMeta(f.meta)
 	// And save the parent
-	f.parent.mu.Lock()
-	defer f.parent.mu.Unlock()
+	// f.parent.mu.Lock()
+	// defer f.parent.mu.Unlock()
 	if err := f.parent.Save(); err != nil {
 		return err
 	}
@@ -1407,8 +1414,8 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 
 func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	f.log.Debug("OP Listxattr")
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 	return handleListxattr(f.meta, resp)
 }
 
@@ -1461,15 +1468,15 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 
 func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	f.log.Debug("OP Getxattr", "name", req.Name)
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 	return handleGetxattr(f.parent.fs, f.meta, req, resp)
 }
 
 func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
 	f.log.Debug("OP Removexattr", "name", req.Name)
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	// Can't delete virtual attributes
 	if _, exists := virtualXAttrs[req.Name]; exists {
@@ -1509,6 +1516,10 @@ func (f *File) Size() int {
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.log.Debug("OP Attr")
 	defer f.log.Debug("OP Attr END")
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
 	a.Inode = 0
 	a.Mode = os.FileMode(f.meta.Mode)
 	a.Uid = f.fs.uid
@@ -1528,9 +1539,14 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 	f.log.Debug("OP Setattr")
 	defer f.log.Debug("OP Setattr END")
+
 	if f.fs.Immutable() {
 		return fuse.EPERM
 	}
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
 	//if req.Valid&fuse.SetattrMode != 0 {
 	//if err := os.Chmod(n.path, req.Mode); err != nil {
 	//	return err
@@ -1576,6 +1592,10 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
 	f.log.Debug("OP Open")
 	defer f.log.Debug("OP Open END")
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
 	f.state.openCount++
 	f.log.Debug("open count", "count", f.state.openCount)
 	if f.state.openCount == 1 && len(f.meta.Refs) > 0 {
@@ -1596,14 +1616,17 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 }
 
 func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
-	f.mu.Lock()
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
+	// f.mu.Lock()
 	// XXX(tsileo): have a counter of open and only release when it's goes to 0?
 	f.log.Debug("OP Release")
 	defer func() {
 		f.state.openCount--
 		f.log.Debug("new openCount", "count", f.state.openCount)
 		f.log.Debug("OP Release END")
-		f.mu.Unlock()
+		// f.mu.Unlock()
 	}()
 
 	if f.state.openCount == 1 {
@@ -1618,8 +1641,8 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 			if err != nil {
 				return err
 			}
-			f.parent.mu.Lock()
-			defer f.parent.mu.Unlock()
+			// f.parent.mu.Lock()
+			// defer f.parent.mu.Unlock()
 			if err := f.parent.Save(); err != nil {
 				return err
 			}
@@ -1645,10 +1668,12 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
 	defer f.log.Debug("OP Read END", "offset", req.Offset, "size", req.Size)
+
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
 	if f.data == nil && f.FakeFile == nil {
 		f.log.Debug("Aborting, data or FakeFile is nil")
 		return nil
