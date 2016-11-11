@@ -26,6 +26,29 @@ def random_name(l=10):
     return ''.join([random.choice(string.ascii_lowercase) for c in xrange(l)])
 
 
+class BlobStash(object):
+    def __init__(self, rebuild=True):
+        self.process = None
+
+    def run(self):
+        """Execute `blobsfs-mount {fs_name} {fs_name}` and return the running process."""
+        self.process = Popen(['blobstash', './tests/blobstash.yaml'], env=os.environ)
+        time.sleep(1)
+        if self.process.poll():
+            raise Exception('failed to mount')
+
+    def cleanup(self):
+        """Cleanup func."""
+        try:
+            shutil.rmtree('blobstash_data')
+        except:
+            pass
+
+    def shutdown(self):
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+
 class BlobFS(object):
     def __init__(self, rebuild=True):
         self.process = None
@@ -159,6 +182,11 @@ class Dir(object):
         path = os.path.join(self.path, name)
         return File.from_random(path)
 
+blobstash = BlobStash()
+blobstash.cleanup()
+
+blobstash.run()
+
 blobfs = BlobFS()
 blobfs.cleanup()
 
@@ -235,3 +263,4 @@ try:
 
 finally:
     blobfs.unmount()
+    blobstash.shutdown()

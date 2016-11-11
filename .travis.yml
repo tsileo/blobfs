@@ -1,4 +1,6 @@
 language: go
+env:
+  - BLOBSTASH_API_KEY=123
 
 go:
   - 1.7
