@@ -18,6 +18,10 @@ func New(ref string) *Root {
 	}
 }
 
+func (r *Root) JSON() ([]byte, error) {
+	return json.Marshal(r)
+}
+
 func NewFromJSON(data []byte) (*Root, error) {
 	root := &Root{}
 	if err := json.Unmarshal(data, root); err != nil {
