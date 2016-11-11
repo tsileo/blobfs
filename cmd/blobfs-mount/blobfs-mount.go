@@ -37,13 +37,8 @@ import (
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
-// FIXME(tsileo): moving to an unexisting directory make the process hang?
 // TODO(tsileo): use fs func for invalidating kernel cache
-// TODO(tsileo): don't use defer for dir Mutex
-// TODO(tsileo): no more name in Dir/File, read it from the meta
-// TODO(tsileo): update the README (no more CVS feature like commit)
 // TODO(tsileo): conditional request on the remote kvstore
-// TODO(tsileo): cleanup the root handling
 // TODO(tsileo): improve sync, better locking, check that x minutes without activity before sync
 // and only scan the hash needed
 // TODO(tsileo): use the garbage collector
@@ -872,14 +867,18 @@ func (d *Dir) SetMeta(m *meta.Meta) {
 }
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
+	d.log.Debug("OP Attr")
+
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
-	d.log.Debug("OP Attr")
+
 	if d.parent == nil {
+		// Root should have Inode 2
 		a.Inode = 2
 	} else {
 		a.Inode = 0
 	}
+
 	a.Mode = os.ModeDir | 0555
 	a.Uid = d.fs.uid
 	a.Gid = d.fs.gid
@@ -908,10 +907,9 @@ func makePublic(node Node, value string) error {
 
 func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	d.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
+
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
-	// d.mu.Lock()
-	// defer d.mu.Unlock()
 
 	// If the request is to make the dir public, make it recursively
 	if req.Name == "public" {
@@ -940,6 +938,7 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 
 func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
 	d.log.Debug("OP Removexattr", "name", req.Name)
+
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
 
@@ -975,21 +974,26 @@ func (d *Dir) Forget() {
 
 func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	d.log.Debug("OP Listxattr")
+
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
+
 	return handleListxattr(d.meta, resp)
 }
 
 func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	d.log.Debug("OP Getxattr", "name", req.Name)
+
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
+
 	return handleGetxattr(d.fs, d.meta, req, resp)
 }
 
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
 	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
+
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
 
@@ -1128,6 +1132,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	d.log.Debug("OP Remove", "name", req.Name)
 	defer d.log.Debug("OP Remove END", "name", req.Name)
+
 	if d.fs.Immutable() {
 		return fuse.EPERM
 	}
@@ -1215,6 +1220,7 @@ func (d *Dir) Save() error {
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	d.log.Debug("OP Create", "name", req.Name)
 	defer d.log.Debug("OP Create END", "name", req.Name)
+
 	if d.fs.Immutable() {
 		return nil, nil, fuse.EPERM
 	}
@@ -1339,6 +1345,7 @@ func (*ClosingBuffer) Close() error {
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.log.Debug("OP Flush")
 	defer f.log.Debug("OP Flush END")
+
 	return nil
 }
 
@@ -1414,8 +1421,10 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 
 func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	f.log.Debug("OP Listxattr")
+
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+
 	return handleListxattr(f.meta, resp)
 }
 
@@ -1463,13 +1472,16 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 		resp.Xattr = []byte(m.XAttrs[req.Name])
 		return nil
 	}
+
 	return fuse.ErrNoXattr
 }
 
 func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	f.log.Debug("OP Getxattr", "name", req.Name)
+
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+
 	return handleGetxattr(f.parent.fs, f.meta, req, resp)
 }
 
@@ -1502,6 +1514,7 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 		return nil
 
 	}
+
 	return fuse.ErrNoXattr
 }
 
@@ -1525,6 +1538,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Uid = f.fs.uid
 	a.Gid = f.fs.gid
 	a.Size = uint64(f.Size())
+
 	if f.meta.ModTime != "" {
 		t, err := time.Parse(time.RFC3339, f.meta.ModTime)
 		if err != nil {
@@ -1532,7 +1546,9 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 		}
 		a.Mtime = t
 	}
+
 	f.log.Debug("attrs", "a", a)
+
 	return nil
 }
 
@@ -1619,14 +1635,11 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 
-	// f.mu.Lock()
-	// XXX(tsileo): have a counter of open and only release when it's goes to 0?
 	f.log.Debug("OP Release")
 	defer func() {
 		f.state.openCount--
 		f.log.Debug("new openCount", "count", f.state.openCount)
 		f.log.Debug("OP Release END")
-		// f.mu.Unlock()
 	}()
 
 	if f.state.openCount == 1 {
