@@ -1646,9 +1646,11 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
 	defer f.log.Debug("OP Read END", "offset", req.Offset, "size", req.Size)
 	if f.data == nil && f.FakeFile == nil {
+		f.log.Debug("Aborting, data or FakeFile is nil")
 		return nil
 	}
 	if req.Offset >= int64(f.meta.Size) {
+		f.log.Debug("Aborting, out of boundaries offset")
 		return nil
 	}
 	if f.fs.Immutable() {
@@ -1667,5 +1669,6 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 
 	f.log.Debug("Reading from memory")
 	fuseutil.HandleRead(req, res, f.data)
+	f.log.Debug("Resp len", "len", len(res.Data))
 	return nil
 }
