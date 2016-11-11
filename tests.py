@@ -202,6 +202,7 @@ try:
 
     # Create a file
     f1 = root_dir.create_file()
+    time.sleep(0.5)
     # Ensure we can see the newly created file in the root dir
     assert root_dir.list() == [f1.basename]
 
@@ -209,6 +210,7 @@ try:
 
     # Edit the file
     f1.edit()
+    time.sleep(0.5)
 
     f1.read_and_check()
 
@@ -217,6 +219,7 @@ try:
     with open(os.path.join(mnt, f3_name), 'wb+') as f3:
         f3.write(f3_content)
         f3.flush()
+        time.sleep(0.5)
 
         # Ensure we can see the content after the flush if we open the file again
         with open(os.path.join(mnt, f3_name)) as f3ro:
@@ -226,10 +229,12 @@ try:
 
         f3.write(f3_content)
 
+    time.sleep(0.5)
     with open(os.path.join(mnt, f3_name)) as f3:
         assert f3.read() == f3_content * 2
 
     d1 = root_dir.create_dir()
+    time.sleep(0.5)
 
     # Ensure the file is created
     assert len(root_dir.list()) == 3
@@ -246,17 +251,19 @@ try:
 
 
     f2 = d1.create_file()
+    time.sleep(0.5)
 
     f2.read_and_check()
 
     f2.move(os.path.join(mnt, random_name()))
+    time.sleep(0.5)
 
     f2.read_and_check()
 
     f2.move(os.path.join(mnt, d1.basename, random_name()))
+    time.sleep(0.5)
 
     f2.read_and_check()
-
 
     # TODO(tsileo): enable this on console flag to "test" new test more easily
     # from IPython import embed; embed()
