@@ -129,9 +129,9 @@ func apiCheckoutHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var immutable bool
-	if cr.Ref == bfs.latest.ref {
-		immutable = true
-	}
+	// if cr.Ref == bfs.latest.ref {
+	// 	immutable = true
+	// }
 	if err := bfs.setRoot(cr.Ref, immutable); err != nil {
 		panic(err)
 	}
@@ -220,14 +220,6 @@ func iterDir(dir *Dir, cb func(n Node) error) error {
 		}
 	}
 	return cb(dir)
-}
-
-func getLatestRemoteRoot() (*root.Root, error) {
-	rkv, err := bfs.rkv.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
-	if err != nil {
-		return nil, err
-	}
-	return root.NewFromJSON(rkv.Data)
 }
 
 // Borrowed from https://github.com/ipfs/go-ipfs/blob/master/fuse/mount/mount.go
@@ -392,9 +384,12 @@ func main() {
 		immutable:  *immutablePtr,
 		host:       bsOpts.Host,
 		sync:       make(chan struct{}),
-		latest:     &Mount{},
 		mount:      &Mount{},
 	}
+	// rkv, err := bfs.rkv.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
 
 	go func() {
 		for {
@@ -636,12 +631,15 @@ type FS struct {
 	mu              sync.Mutex // Guard for the sync goroutine
 	lastRootVersion int
 	sync            chan struct{}
-	lastWrite       time.Time
+	lastOP          time.Time
 	root            fs.Node
 	mount           *Mount
-	latest          *Mount
 	uid             uint32
 	gid             uint32
+}
+
+func (f *FS) updateLastOP() {
+	f.lastOP = time.Now()
 }
 
 type Mount struct {
@@ -654,10 +652,43 @@ func (m *Mount) Empty() bool {
 	return m.ref == ""
 }
 
-func (m *Mount) Copy(m2 *Mount) {
-	m2.immutable = m.immutable
-	m2.root = m.root
-	m2.ref = m.ref
+func (f *FS) Refs() ([]string, error) {
+	f.log.Info("Fetching refs")
+	defer f.log.Info("Fetching refs done")
+
+	wg.Add(1)
+	defer wg.Done()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	refs := []string{}
+
+	rootNode, err := bfs.Root()
+	if err != nil {
+		f.log.Error("Failed to fetch root", "err", err)
+		return nil, err
+	}
+
+	rootDir := rootNode.(*Dir)
+
+	if err := iterDir(rootDir, func(node Node) error {
+		ref := node.Meta().Hash
+		refs = append(refs, ref)
+		if !node.IsDir() {
+			for _, iref := range node.Meta().Refs {
+				data := iref.([]interface{})
+				ref := data[1].(string)
+				refs = append(refs, ref)
+			}
+		}
+		return nil
+	}); err != nil {
+		f.log.Error("iterDir failed", "err", err)
+		return nil, err
+	}
+
+	return refs, nil
 }
 
 func (f *FS) Immutable() bool {
@@ -795,7 +826,6 @@ func (f *FS) loadRoot() (fs.Node, error) {
 	}
 	f.log.Info("initial load", "mount", f.mount)
 	f.mount = &Mount{immutable: f.immutable, root: rootNode, ref: rootNode.Meta().Hash}
-	f.mount.Copy(f.latest)
 	return f.mount.root, nil
 }
 
@@ -868,6 +898,7 @@ func (d *Dir) SetMeta(m *meta.Meta) {
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	d.log.Debug("OP Attr")
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -907,6 +938,7 @@ func makePublic(node Node, value string) error {
 
 func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	d.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -938,6 +970,7 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 
 func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
 	d.log.Debug("OP Removexattr", "name", req.Name)
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -970,10 +1003,12 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 
 func (d *Dir) Forget() {
 	d.log.Debug("OP Forget")
+	d.fs.updateLastOP()
 }
 
 func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	d.log.Debug("OP Listxattr")
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -983,6 +1018,7 @@ func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *f
 
 func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	d.log.Debug("OP Getxattr", "name", req.Name)
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -992,7 +1028,7 @@ func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fus
 
 func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	d.log.Debug("OP Rename", "name", req.OldName, "new_name", req.NewName)
-	defer d.log.Debug("OP Rename end", "name", req.OldName, "new_name", req.NewName)
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -1033,7 +1069,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	d.log.Debug("OP Lookup", "name", name)
-	defer d.log.Debug("OP Lookup END", "name", name)
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -1058,7 +1094,7 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	d.log.Debug("OP ReadDirAll")
-	defer d.log.Debug("OP ReadDirAll END")
+	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
@@ -1086,7 +1122,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	d.log.Debug("OP Mkdir", "name", req.Name)
-	defer d.log.Debug("OP Mkdir END", "name", req.Name)
+	d.fs.updateLastOP()
 
 	if d.fs.Immutable() {
 		return nil, fuse.EPERM
@@ -1131,7 +1167,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	d.log.Debug("OP Remove", "name", req.Name)
-	defer d.log.Debug("OP Remove END", "name", req.Name)
+	d.fs.updateLastOP()
 
 	if d.fs.Immutable() {
 		return fuse.EPERM
@@ -1219,7 +1255,7 @@ func (d *Dir) Save() error {
 
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	d.log.Debug("OP Create", "name", req.Name)
-	defer d.log.Debug("OP Create END", "name", req.Name)
+	d.fs.updateLastOP()
 
 	if d.fs.Immutable() {
 		return nil, nil, fuse.EPERM
@@ -1309,7 +1345,7 @@ func (f *File) SetMeta(m *meta.Meta) {
 
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	f.log.Debug("OP Write", "offset", req.Offset, "size", len(req.Data))
-	defer f.log.Debug("OP Write END", "offset", req.Offset, "size", len(req.Data))
+	f.fs.updateLastOP()
 
 	if f.fs.Immutable() {
 		return fuse.EPERM
@@ -1344,13 +1380,14 @@ func (*ClosingBuffer) Close() error {
 
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.log.Debug("OP Flush")
-	defer f.log.Debug("OP Flush END")
+	f.fs.updateLastOP()
 
 	return nil
 }
 
 func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	f.log.Debug("OP Setxattr", "name", req.Name, "xattr", string(req.Xattr))
+	f.fs.updateLastOP()
 
 	if f.fs.Immutable() {
 		return nil
@@ -1421,6 +1458,7 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 
 func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
 	f.log.Debug("OP Listxattr")
+	f.fs.updateLastOP()
 
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -1478,6 +1516,7 @@ func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.
 
 func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	f.log.Debug("OP Getxattr", "name", req.Name)
+	f.fs.updateLastOP()
 
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -1487,6 +1526,8 @@ func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 
 func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
 	f.log.Debug("OP Removexattr", "name", req.Name)
+	f.fs.updateLastOP()
+
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 
@@ -1528,7 +1569,7 @@ func (f *File) Size() int {
 
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.log.Debug("OP Attr")
-	defer f.log.Debug("OP Attr END")
+	f.fs.updateLastOP()
 
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -1554,7 +1595,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 	f.log.Debug("OP Setattr")
-	defer f.log.Debug("OP Setattr END")
+	f.fs.updateLastOP()
 
 	if f.fs.Immutable() {
 		return fuse.EPERM
@@ -1607,7 +1648,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
 	f.log.Debug("OP Open")
-	defer f.log.Debug("OP Open END")
+	f.fs.updateLastOP()
 
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -1632,10 +1673,12 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 }
 
 func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	f.log.Debug("OP Release")
+	f.fs.updateLastOP()
+
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 
-	f.log.Debug("OP Release")
 	defer func() {
 		f.state.openCount--
 		f.log.Debug("new openCount", "count", f.state.openCount)
@@ -1676,13 +1719,14 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	f.log.Debug("OP Fsync")
+	f.fs.updateLastOP()
 	// XXX(tsileo): flush the file?
 	return nil
 }
 
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
 	f.log.Debug("OP Read", "offset", req.Offset, "size", req.Size)
-	defer f.log.Debug("OP Read END", "offset", req.Offset, "size", req.Size)
+	f.fs.updateLastOP()
 
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
