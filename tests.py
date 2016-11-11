@@ -219,7 +219,7 @@ try:
     with open(os.path.join(mnt, f3_name), 'wb+') as f3:
         f3.write(f3_content)
         f3.flush()
-        time.sleep(0.5)
+        time.sleep(1)
 
         # Ensure we can see the content after the flush if we open the file again
         with open(os.path.join(mnt, f3_name)) as f3ro:
