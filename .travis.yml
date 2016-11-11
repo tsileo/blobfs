@@ -9,6 +9,7 @@ before_install:
  - sudo chmod 666 /dev/fuse
  - sudo chown root:$USER /etc/fuse.conf
 script:
+  - go get github.com/tsileo/blobstash
   - go install github.com/tsileo/blobstash
   - go test -v ./...
   - python tests.py
