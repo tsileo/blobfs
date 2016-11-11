@@ -1,0 +1,10 @@
+language: go
+
+go:
+  - 1.7
+before_install:
+ - sudo apt-get install python
+
+script:
+  - go test -v .
+  - python tests.py
