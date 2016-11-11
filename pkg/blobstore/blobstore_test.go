@@ -18,13 +18,14 @@ type Blob struct {
 
 func TestBlobStore(t *testing.T) {
 	dir, err := ioutil.TempDir("", "blobfs")
+	t.Logf("tmp dir=%+v\n", dir)
 	if err != nil {
 		panic(err)
 	}
 
 	defer os.RemoveAll(dir) // clean up
 
-	bs, err := New(dir, "testfs")
+	bs, err := New(dir, "testblobfs")
 	if err != nil {
 		panic(err)
 	}
