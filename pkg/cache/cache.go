@@ -7,9 +7,10 @@ import (
 	"golang.org/x/net/context"
 
 	localblobstore "github.com/tsileo/blobfs/pkg/blobstore"
+	"github.com/tsileo/blobfs/pkg/pathutil"
+
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/clientutil"
-	"github.com/tsileo/blobstash/pkg/config/pathutil"
 	"github.com/tsileo/blobstash/pkg/vkv"
 )
 
