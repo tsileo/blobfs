@@ -13,21 +13,22 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
-	_ "path/filepath"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/tsileo/blobfs/pkg/cache"
+	"github.com/tsileo/blobfs/pkg/pathutil"
+	"github.com/tsileo/blobfs/pkg/root"
+
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
-	"github.com/tsileo/blobfs/pkg/cache"
-	"github.com/tsileo/blobfs/pkg/root"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/kvstore"
-	_ "github.com/tsileo/blobstash/pkg/config/pathutil"
 	"github.com/tsileo/blobstash/pkg/filetree/filetreeutil/meta"
 	"github.com/tsileo/blobstash/pkg/filetree/reader/filereader"
 	"github.com/tsileo/blobstash/pkg/filetree/writer"
@@ -91,7 +92,7 @@ type API struct {
 func (api *API) Serve(socketPath string) error {
 	http.HandleFunc("/ref", apiRefHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
-	http.HandleFunc("/log", apiLogHandler)
+	// http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
 	l, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -180,34 +181,35 @@ type CommitLog struct {
 	Current bool   `json:"current"`
 }
 
-func apiLogHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	out := []*CommitLog{}
+// FIXME(tsileo): use the local or remote vkv store for this???
+// func apiLogHandler(w http.ResponseWriter, r *http.Request) {
+// 	if r.Method != "GET" {
+// 		w.WriteHeader(http.StatusMethodNotAllowed)
+// 		return
+// 	}
+// 	out := []*CommitLog{}
 
-	versions, err := bfs.kvs.Versions(fmt.Sprintf(rootKeyFmt, bfs.name), 0, -1, 0)
-	switch err {
-	case kvstore.ErrKeyNotFound:
-	case nil:
-		for _, v := range versions.Versions {
-			croot := &root.Root{}
-			if err := json.Unmarshal(v.Data, croot); err != nil {
-				panic(err)
-			}
-			cl := &CommitLog{
-				T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
-				Ref:     croot.Ref,
-				Comment: croot.Comment,
-			}
-			out = append(out, cl)
-		}
-	default:
-		panic(err)
-	}
-	WriteJSON(w, out)
-}
+// 	versions, err := bfs.kvs.Versions(fmt.Sprintf(rootKeyFmt, bfs.name), 0, -1, 0)
+// 	switch err {
+// 	case kvstore.ErrKeyNotFound:
+// 	case nil:
+// 		for _, v := range versions.Versions {
+// 			croot := &root.Root{}
+// 			if err := json.Unmarshal(v.Data, croot); err != nil {
+// 				panic(err)
+// 			}
+// 			cl := &CommitLog{
+// 				T:       time.Unix(0, int64(v.Version)).Format(time.RFC3339),
+// 				Ref:     croot.Ref,
+// 				Comment: croot.Comment,
+// 			}
+// 			out = append(out, cl)
+// 		}
+// 	default:
+// 		panic(err)
+// 	}
+// 	WriteJSON(w, out)
+// }
 
 // iterDir executes the given callback `cb` on each nodes (file or dir) recursively.
 func iterDir(dir *Dir, cb func(n Node) error) error {
@@ -226,7 +228,7 @@ func iterDir(dir *Dir, cb func(n Node) error) error {
 }
 
 func getLatestRemoteRoot() (*root.Root, error) {
-	rkv, err := bfs.kvs.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
+	rkv, err := bfs.rkv.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +342,7 @@ func main() {
 	}
 	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
 	kvsOpts.SnappyCompression = false
-	kvs := kvstore.New(kvsOpts)
+	rkv := kvstore.New(kvsOpts)
 
 	c, err := fuse.Mount(
 		mountpoint,
@@ -355,12 +357,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// TODO(tsileo): switch to this kv
-	// kv, err := vkv.New(filepath.Join(pathutil.VarDir(), "blobsfs", name, "lkv"))
-	// defer kv.Close()
-	// if err != nil {
-	// 	panic(err)
-	// }
+	if err := pathutil.InitVarDir(); err != nil {
+		fslog.Crit("failed to setup var directory", "err", err)
+		os.Exit(1)
+	}
+
+	// Initialize the local Vkv store that will store all the local mutations
+	lkv, err := vkv.New(filepath.Join(pathutil.VarDir(), fmt.Sprintf("lkv_%s", name)))
+	defer lkv.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	// Retrieve the current user Uid/Gid for using it for hte FS
 	cuser, err := user.Current()
 	if err != nil {
 		fslog.Crit("failed to get current user", "err", err)
@@ -382,14 +391,14 @@ func main() {
 		bs:         bs,
 		uid:        uint32(iuid),
 		gid:        uint32(igid),
-		// lkv:        kv,
-		kvs:       kvs,
-		uploader:  writer.NewUploader(bs),
-		immutable: *immutablePtr,
-		host:      bsOpts.Host,
-		sync:      make(chan struct{}),
-		latest:    &Mount{},
-		mount:     &Mount{},
+		lkv:        lkv,
+		rkv:        rkv,
+		uploader:   writer.NewUploader(bs),
+		immutable:  *immutablePtr,
+		host:       bsOpts.Host,
+		sync:       make(chan struct{}),
+		latest:     &Mount{},
+		mount:      &Mount{},
 	}
 
 	go func() {
@@ -618,9 +627,11 @@ func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
 }
 
 type FS struct {
-	log             log15.Logger
-	kvs             *kvstore.KvStore
-	lkv             *vkv.DB
+	log log15.Logger
+
+	rkv *kvstore.KvStore // remote vkv store
+	lkv *vkv.DB          // local vkv store
+
 	bs              *cache.Cache // blobstore.BlobStore
 	uploader        *writer.Uploader
 	socketPath      string
@@ -702,79 +713,59 @@ func (f *FS) setRoot(ref string, immutable bool) error {
 	return nil
 }
 
+func (f *FS) kvDataToDir(data []byte) (*Dir, error) {
+	lroot, err := root.NewFromJSON([]byte(data))
+	if err != nil {
+		return nil, err
+	}
+	f.log.Debug("decoding root", "root", lroot)
+	// Fetch the root ref
+	blob, err := f.bs.Get(context.TODO(), lroot.Ref)
+	if err != nil {
+		return nil, err
+	}
+	// Decode it as a Meta
+	m, err := meta.NewMetaFromBlob(lroot.Ref, blob)
+	if err != nil {
+		return nil, err
+	}
+	f.log.Debug("loaded meta root", "ref", m.Hash)
+	return NewDir(f, m, nil)
+}
+
 func (f *FS) loadRoot() (fs.Node, error) {
 	// First, try to fetch the local root
-	var rootNode *Dir
-	var newRoot *Dir
-	var localRoot *Dir
-	var remoteRoot *Dir
-	lkv, err := f.bs.Vkv().Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
+	var err error
+	var localRoot, remoteRoot, rootNode Node
+	f.log.Debug("load latest remote mutation")
+	localkv, err := f.lkv.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
-		lroot, err := root.NewFromJSON([]byte(lkv.Data))
-		if err != nil {
-			return nil, err
-		}
-		f.log.Debug("decoding root", "root", lroot)
-		blob, err := f.bs.Get(context.TODO(), lroot.Ref)
-		if err != nil {
-			return nil, err
-		}
-		m, err := meta.NewMetaFromBlob(lroot.Ref, blob)
-		if err != nil {
-			return nil, err
-		}
-		f.log.Debug("loaded meta root", "ref", m.Hash)
-		d, err := NewDir(f, m, nil)
-		if err != nil {
-			return nil, err
-		}
-		localRoot = d
-		// f.mount = &Mount{immutable: f.immutable, root: d, ref: m.Hash}
-		// f.mount.Copy(f.staging)
-		// return d, nil
+		localRoot, err = f.kvDataToDir(localkv.Data)
 	case vkv.ErrNotFound:
 	default:
 		return nil, err
 	}
 
 	// Then, try to fetch the remote root
-	kv, err := f.kvs.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
+	f.log.Debug("load latest remote mutation")
+	remotekv, err := f.rkv.Get(fmt.Sprintf(rootKeyFmt, f.Name()), -1)
 	switch err {
 	case nil:
-		f.lastRootVersion = kv.Version
-		if lkv == nil {
-			if f.bs.Vkv().Put(kv.Key, kv.Hash, kv.Data, kv.Version); err != nil {
+		// There are mutations for this FS in BlobStash
+		remoteRoot, err = f.kvDataToDir(remotekv.Data)
+
+		// Save the latest locally if there's no entry yet
+		if localRoot == nil {
+			f.log.Debug("Saving the latest entry locally")
+			if _, err := f.lkv.Put(remotekv.Key, remotekv.Hash, remotekv.Data, remotekv.Version); err != nil {
 				return nil, err
 			}
 		}
-		rroot, err := root.NewFromJSON(kv.Data)
-		if err != nil {
-			return nil, err
-		}
-		blob, err := f.bs.Get(context.TODO(), rroot.Ref)
-		if err != nil {
-			return nil, err
-		}
-		m, err := meta.NewMetaFromBlob(rroot.Ref, blob)
-		if err != nil {
-			return nil, err
-		}
-		f.log.Debug("loaded meta root", "ref", m.Hash)
-		d, err := NewDir(f, m, nil)
-		if err != nil {
-			return nil, err
-		}
-		remoteRoot = d
-		cmount := &Mount{immutable: f.immutable, root: d, ref: m.Hash}
-		// if f.staging.ref != "" {
-		// 	f.mount = cmount
-		// }
-		cmount.Copy(f.latest)
-		// return d, nil
 	case kvstore.ErrKeyNotFound:
-		if lkv == nil {
-			newRoot = &Dir{
+		// The FS is new, no remote mutation nor local, create the inital root
+		if localRoot == nil {
+			newRoot := &Dir{
 				fs:       f,
 				Children: map[string]Node{},
 				meta:     &meta.Meta{Name: "_root"},
@@ -783,42 +774,37 @@ func (f *FS) loadRoot() (fs.Node, error) {
 			if err := newRoot.Save(); err != nil {
 				return nil, err
 			}
-			f.log.Debug("Creating a new root", "ref", newRoot.meta.Hash)
+			f.log.Debug("Created new root", "ref", newRoot.Meta().Hash)
+			rootNode = newRoot
 		}
-		// root.log = root.log.New("ref", root.meta.Hash)
-		// f.mount = &Mount{immutable: f.immutable, root: root, ref: root.meta.Hash}
-		// f.mount.Copy(f.latest)
 	default:
 		return nil, err
 	}
 	switch {
-	case localRoot == nil && remoteRoot != nil:
-		rootNode = remoteRoot
-	case localRoot != nil && remoteRoot == nil:
-		rootNode = localRoot
-	case localRoot != nil && remoteRoot != nil:
-		t1, err := localRoot.meta.Mtime()
-		if err != nil {
-			return nil, err
-		}
-		t2, err := remoteRoot.meta.Mtime()
-		if err != nil {
-			return nil, err
-		}
-		if t1.After(t2) {
+	case rootNode != nil:
+		// The root was just created and is empty, do nothing
+		// as it's not useful to save an empty dir, it will sync next time
+	case localkv != nil && remotekv != nil:
+		if localkv.Version > remotekv.Version {
 			rootNode = localRoot
 		} else {
+			// The remote mutation is more recent, save it locally
+			if _, err := f.lkv.Put(remotekv.Key, remotekv.Hash, remotekv.Data, remotekv.Version); err != nil {
+				return nil, err
+			}
 			rootNode = remoteRoot
 		}
-	case newRoot != nil:
-		rootNode = newRoot
+	case remoteRoot == nil && localRoot != nil:
+		// The FS has not been synced yet
+		// TODO(tsileo): trigger a sync
 	}
 	f.log.Info("initial load", "mount", f.mount)
-	f.mount = &Mount{immutable: f.immutable, root: rootNode, ref: rootNode.meta.Hash}
+	f.mount = &Mount{immutable: f.immutable, root: rootNode, ref: rootNode.Meta().Hash}
 	f.mount.Copy(f.latest)
 	return f.mount.root, nil
 }
 
+// the Node interface wraps `fs.Node`
 type Node interface {
 	fs.Node
 	Meta() *meta.Meta
@@ -1201,9 +1187,14 @@ func (d *Dir) Save() error {
 		if err != nil {
 			return err
 		}
-		if _, err := d.fs.bs.Vkv().Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), "", js, -1); err != nil {
+
+		// Save the mutation locally
+		kv, err := d.fs.lkv.Put(fmt.Sprintf(rootKeyFmt, d.fs.Name()), "", js, -1)
+		if err != nil {
 			return err
 		}
+		d.log.Debug("Creating a new VKV entry", "entry", kv)
+
 		d.fs.mount.ref = mhash
 		d.fs.mount.root = d
 	} else {
