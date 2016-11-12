@@ -41,8 +41,11 @@ import (
 // TODO(tsileo): conditional request on the remote kvstore
 // TODO(tsileo): improve sync, better locking, check that x minutes without activity before sync
 // and only scan the hash needed
-// TODO(tsileo): use the garbage collector
 // TODO(tsileo): handle setattr, user, ctime/atime, mode check by user
+// TODO(tsileo):
+// - a prune command using the GC
+// - a cache command download all the blobs needed for the FS
+// - basic conflict handling, copy new files, and file.conflicted if conflicts
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -410,14 +413,9 @@ func main() {
 				l.Debug("fetched refs", "len", len(refs))
 
 				fsName := fmt.Sprintf(rootKeyFmt, bfs.Name())
+				localVersion := bfs.mount.root.Version
 
-				localkv, err := bfs.lkv.Get(fsName, -1)
-				if err != nil {
-					l.Error("Sync failed (failed to fetch the local vkv entry)", "err", err)
-					return err
-				}
-
-				remotekv, err := bfs.rkv.Get(fsName, -1)
+				remoteKv, err := bfs.rkv.Get(fsName, -1)
 				if err != nil {
 					l.Error("Sync failed (failed to fetch the remote vkv entry)", "err", err)
 					if err != kvstore.ErrKeyNotFound {
@@ -425,15 +423,16 @@ func main() {
 					}
 				}
 				remoteVersion := 0
-				if remotekv != nil {
-					remoteVersion = remotekv.Version
+				if remoteKv != nil {
+					remoteVersion = remoteKv.Version
 				}
-				l.Debug("last sync info", "current version", localkv.Version, "remote version", remoteVersion)
+				l.Debug("last sync info", "current version", localVersion, "remote version", remoteVersion)
 
-				if localkv.Version == remoteVersion {
+				if localVersion == remoteVersion {
 					l.Info("Already in sync")
 					return nil
 				}
+				// FIXME(tsileo): finish the sync
 
 				// putBlob will try to upload all missing blobs to the remote BlobStash instance
 				// putBlob := func(l log15.Logger, hash string, blob []byte) error {
@@ -581,19 +580,24 @@ type FS struct {
 	rkv *kvstore.KvStore // remote vkv store
 	lkv *vkv.DB          // local vkv store
 
-	bs              *cache.Cache // blobstore.BlobStore
-	uploader        *writer.Uploader
-	socketPath      string
-	immutable       bool
-	name            string
-	host            string
-	mu              sync.Mutex // Guard for the sync goroutine
+	bs         *cache.Cache // blobstore.BlobStore
+	uploader   *writer.Uploader
+	socketPath string
+	immutable  bool
+
+	name string
+	host string
+
 	lastRootVersion int
 	sync            chan struct{}
 	lastOP          time.Time
-	mount           *Mount
-	uid             uint32
-	gid             uint32
+
+	mount *Mount
+
+	uid uint32
+	gid uint32
+
+	mu sync.Mutex // Guard for the sync goroutine
 }
 
 func (f *FS) updateLastOP() {
@@ -604,7 +608,6 @@ type Mount struct {
 	immutable bool
 	node      Node
 	root      *root.Root
-	kv        *vkv.KeyValue
 }
 
 func (m *Mount) Empty() bool {
@@ -674,19 +677,18 @@ func (f *FS) Root() (fs.Node, error) {
 	return f.mount.node, nil
 }
 
-func (f *FS) setRoot(root *root.Root, kv *vkv.KeyValue, node Node, immutable bool) error {
+func (f *FS) setRoot(root *root.Root, node Node, immutable bool) error {
 	f.log.Info("setRoot", "root", root, "node", node)
 	f.mount = &Mount{
 		immutable: immutable,
 		node:      node,
 		root:      root,
-		kv:        kv,
 	}
 	return nil
 }
 
-func (f *FS) kvDataToDir(data []byte) (*root.Root, *Dir, error) {
-	lroot, err := root.NewFromJSON([]byte(data))
+func (f *FS) kvDataToDir(data []byte, version int) (*root.Root, *Dir, error) {
+	lroot, err := root.NewFromJSON([]byte(data), version)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -721,7 +723,7 @@ func (f *FS) loadRoot() (Node, error) {
 	localKv, err := f.lkv.Get(fsName, -1)
 	switch err {
 	case nil:
-		localRoot, localNode, err = f.kvDataToDir(localKv.Data)
+		localRoot, localNode, err = f.kvDataToDir(localKv.Data, localKv.Version)
 	case vkv.ErrNotFound:
 	default:
 		return nil, err
@@ -733,7 +735,7 @@ func (f *FS) loadRoot() (Node, error) {
 	switch err {
 	case nil:
 		// There are mutations for this FS in BlobStash
-		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data)
+		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data, remoteKv.Version)
 
 		// Save the latest locally if there's no entry yet
 		if localNode == nil {
@@ -791,7 +793,7 @@ func (f *FS) loadRoot() (Node, error) {
 	}
 	f.log.Info("initial load", "mount", f.mount)
 	if err != nil {
-		if err := f.setRoot(localRoot, localKv, localNode, f.immutable); err != nil {
+		if err := f.setRoot(localRoot, localNode, f.immutable); err != nil {
 			return nil, err
 		}
 	}
@@ -1197,7 +1199,7 @@ func (d *Dir) Save() error {
 	}
 	if d.parent == nil {
 		// If no parent, this is the root so save the ref
-		root := root.New(mhash)
+		root := root.New(mhash, 0)
 		js, err := json.Marshal(root)
 		if err != nil {
 			return err
@@ -1208,9 +1210,10 @@ func (d *Dir) Save() error {
 		if err != nil {
 			return err
 		}
+		root.Version = kv.Version
 		d.log.Debug("Creating a new VKV entry", "entry", kv)
 
-		if err := d.fs.setRoot(root, kv, d, d.fs.immutable); err != nil {
+		if err := d.fs.setRoot(root, d, d.fs.immutable); err != nil {
 			return err
 		}
 	} else {
