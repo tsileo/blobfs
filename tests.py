@@ -249,6 +249,15 @@ try:
 
     assert eraised
 
+    # Check that a non-existing file return ENOENT (2)
+    eraised = False
+    try:
+        open('idoesnotexist')
+    except IOError as exc:
+        eraised = True
+        assert exc.errno == 2
+
+    assert eraised
 
     f2 = d1.create_file()
     # time.sleep(0.5)
