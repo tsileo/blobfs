@@ -46,6 +46,8 @@ import (
 // - a prune command using the GC
 // - a cache command download all the blobs needed for the FS
 // - basic conflict handling, copy new files, and file.conflicted if conflicts
+// - a -no-startup-sync flag for offline use?
+// - a -cache mode
 
 const maxInt = int(^uint(0) >> 1)
 
@@ -389,100 +391,12 @@ func main() {
 		sync:       make(chan struct{}),
 		mount:      &Mount{},
 	}
-	// rkv, err := bfs.rkv.Get(fmt.Sprintf(rootKeyFmt, bfs.Name()), -1)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
 
 	go func() {
 		for {
-			sync := func() error {
-				wg.Add(1)
-				defer wg.Done()
-				l := fslog.New("module", "sync")
-				l.Debug("Sync triggered")
-
-				// Keep some basic stats about the on-going sync
-				stats := &SyncStats{}
-				defer l.Info("Sync done", "blobs_uploaded", stats.BlobsUploaded, "blobs_skipped", stats.BlobsSkipped)
-
-				refs, err := bfs.Refs()
-				if err != nil {
-					return err
-				}
-				l.Debug("fetched refs", "len", len(refs))
-
-				fsName := fmt.Sprintf(rootKeyFmt, bfs.Name())
-				localVersion := bfs.mount.root.Version
-
-				remoteKv, err := bfs.rkv.Get(fsName, -1)
-				if err != nil {
-					l.Error("Sync failed (failed to fetch the remote vkv entry)", "err", err)
-					if err != kvstore.ErrKeyNotFound {
-						return err
-					}
-				}
-				remoteVersion := 0
-				if remoteKv != nil {
-					remoteVersion = remoteKv.Version
-				}
-				l.Debug("last sync info", "current version", localVersion, "remote version", remoteVersion)
-
-				if localVersion == remoteVersion {
-					l.Info("Already in sync")
-					return nil
-				}
-				// FIXME(tsileo): finish the sync
-
-				// putBlob will try to upload all missing blobs to the remote BlobStash instance
-				// putBlob := func(l log15.Logger, hash string, blob []byte) error {
-				// 	mexists, err := bfs.bs.StatRemote(hash)
-				// 	if err != nil {
-				// 		l.Error("stat failed", "err", err)
-				// 		return err
-				// 	}
-				// 	if mexists {
-				// 		stats.BlobsSkipped++
-				// 	} else {
-				// 		// Fetch the blob locally via the cache if needed
-				// 		if blob == nil {
-				// 			blob, err = bfs.bs.Get(context.TODO(), hash)
-				// 			if err != nil {
-				// 				return err
-				// 			}
-
-				// 		}
-				// 		l.Debug("Uploading blob", "hash", hash)
-				// 		if err := bfs.bs.PutRemote(hash, blob); err != nil {
-				// 			l.Error("put failed", "err", err)
-				// 			return err
-				// 		}
-				// 		stats.BlobsUploaded++
-				// 	}
-				// 	return nil
-				// }
-				// FIXME(tsileo): get the kv, store it in the fs, a func to check lkv/rkv
-
-				// newRoot := &root.Root{}
-				// if err := json.Unmarshal([]byte(kv.Data), newRoot); err != nil {
-				// 	return err
-				// }
-				// if _, err := bfs.lkv.Put(remotekv.Key, remotekv.Hash, remotekv.Data, remotekv.Version); err != nil {
-				// 	l.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
-				// 	return err
-				// }
-
-				// return bfs.setRoot(newRoot.Ref, bfs.Immutable())
-
-				// bfs.latest.ref = newRoot.Ref
-				// bfs.latest.root = rootDir
-				return nil
-			}
-
 			select {
 			case <-bfs.sync:
 				fslog.Info("Sync triggered")
-				sync()
 			}
 		}
 	}()
@@ -580,24 +494,24 @@ type FS struct {
 	rkv *kvstore.KvStore // remote vkv store
 	lkv *vkv.DB          // local vkv store
 
-	bs         *cache.Cache // blobstore.BlobStore
-	uploader   *writer.Uploader
-	socketPath string
-	immutable  bool
+	bs       *cache.Cache     // blobstore.BlobStore wrapper
+	uploader *writer.Uploader // BlobStash FileTree client
 
-	name string
-	host string
+	socketPath string // Socket used for HTTP FS communications
 
-	lastRootVersion int
-	sync            chan struct{}
-	lastOP          time.Time
+	name      string
+	host      string
+	immutable bool
+
+	sync   chan struct{}
+	lastOP time.Time
 
 	mount *Mount
 
-	uid uint32
-	gid uint32
+	uid uint32 // Current user uid
+	gid uint32 // Current user gid
 
-	mu sync.Mutex // Guard for the sync goroutine
+	mu sync.Mutex
 }
 
 func (f *FS) updateLastOP() {
@@ -614,7 +528,10 @@ func (m *Mount) Empty() bool {
 	return m.node == nil
 }
 
-func (f *FS) Refs() ([]string, error) {
+// Refs returns a "snapshot" of the FS:
+// - the root ref
+// - a slice of refs containing all the blobfs of the Tree
+func (f *FS) Refs() (*root.Root, []string, error) {
 	f.log.Info("Fetching refs")
 	defer f.log.Info("Fetching refs done")
 
@@ -629,7 +546,7 @@ func (f *FS) Refs() ([]string, error) {
 	rootNode, err := bfs.Root()
 	if err != nil {
 		f.log.Error("Failed to fetch root", "err", err)
-		return nil, err
+		return nil, nil, err
 	}
 
 	rootDir := rootNode.(*Dir)
@@ -647,10 +564,65 @@ func (f *FS) Refs() ([]string, error) {
 		return nil
 	}); err != nil {
 		f.log.Error("iterDir failed", "err", err)
-		return nil, err
+		return nil, nil, err
 	}
 
-	return refs, nil
+	// FIXME(tsileo): ensure the root returned won't change once the FS is modified
+	return bfs.mount.root, refs, nil
+}
+
+// Push saves all the blobs of the tree, and add the VK entry to the remote BlobStash instance
+func (f *FS) Push() error {
+	f.log.Info("Pushing data")
+
+	wg.Add(1)
+	defer wg.Done()
+
+	// Keep some basic stats about the on-going sync
+	stats := &SyncStats{}
+	defer f.log.Info("Push done", "blobs_uploaded", stats.BlobsUploaded, "blobs_skipped", stats.BlobsSkipped)
+
+	croot, refs, err := bfs.Refs()
+	if err != nil {
+		return err
+	}
+	f.log.Debug("snapshot fetched", "root", croot, "len", len(refs))
+
+	// First save all the blobs of the tree
+	for _, ref := range refs {
+		exists, err := f.bs.StatRemote(ref)
+		if err != nil {
+			f.log.Error("stat failed", "err", err)
+			return err
+		}
+		if exists {
+			stats.BlobsSkipped++
+		} else {
+			blob, err := f.bs.Get(context.TODO(), ref)
+			if err != nil {
+				f.log.Error("Failed to fetch blob from cached", "err", err)
+			}
+			if err := f.bs.PutRemote(ref, blob); err != nil {
+				f.log.Error("PutRemote failed", "err", err)
+				return err
+			}
+			stats.BlobsUploaded++
+		}
+	}
+
+	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
+	jsRoot, err := croot.JSON()
+	if err != nil {
+		return err
+	}
+	// Set a KV entry for this mutation
+	// FIXME(tsileo): conditional request to ensure the previous version is the same
+	if _, err := bfs.rkv.Put(fsName, "", jsRoot, croot.Version); err != nil {
+		f.log.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
+		return err
+	}
+
+	return nil
 }
 
 func (f *FS) Immutable() bool {
@@ -1276,10 +1248,12 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	}
 	f.state.openCount++
 	f.log.Debug("new openCount", "count", f.state.openCount)
+
 	stats.Lock()
 	stats.updated = true
 	stats.FilesCreated++
 	stats.Unlock()
+
 	return f, f, nil
 }
 
