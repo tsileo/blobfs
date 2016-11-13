@@ -252,7 +252,7 @@ try:
     # Check that a non-existing file return ENOENT (2)
     eraised = False
     try:
-        open('idoesnotexist')
+        open('itdoesnotexist')
     except IOError as exc:
         eraised = True
         assert exc.errno == 2

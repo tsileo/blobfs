@@ -210,6 +210,12 @@ type CommitLog struct {
 
 // iterDir executes the given callback `cb` on each nodes (file or dir) recursively.
 func iterDir(dir *Dir, cb func(n Node) error) error {
+	if dir.Children == nil {
+		if err := dir.reload(); err != nil {
+			return err
+		}
+	}
+
 	for _, node := range dir.Children {
 		if node.IsDir() {
 			if err := iterDir(node.(*Dir), cb); err != nil {
@@ -557,6 +563,69 @@ func (m *Mount) Copy(m2 *Mount) {
 	m2.immutable = m.immutable
 	m2.node = m.node
 	m2.root = m.root
+}
+
+func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
+	root := []*NodeStatus{}
+	index := map[string]*NodeStatus{}
+	if err := iterDir(d, func(node Node) error {
+		switch n := node.(type) {
+		case *File:
+			path := ""
+			if n.parent.meta.Name != "_root" {
+				p1 := n.parent
+				for p1.parent != nil {
+					path = filepath.Join(path, p1.meta.Name)
+					p1 = p1.parent
+				}
+			}
+			p := filepath.Join(path, n.meta.Name)
+			nd := &NodeStatus{Type: "file", Path: p, Ref: n.meta.Hash}
+			root = append(root, nd)
+			index[p] = nd
+		case *Dir:
+			path := ""
+			// if n.meta.Name == "_root" {
+			// 	return nil
+			// }
+			if n.parent != nil {
+				p1 := n.parent
+				for p1.parent != nil {
+					path = filepath.Join(path, p1.meta.Name)
+					p1 = p1.parent
+				}
+			}
+			p := filepath.Join(path, n.meta.Name) + "/"
+			nd := &NodeStatus{Type: "dir", Path: p, Ref: n.meta.Hash}
+			root = append(root, nd)
+			index[p] = nd
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	return root, index
+}
+func (f *FS) remoteIndex(ref string) (map[string]string, error) {
+	resp, err := f.bs.Client().DoReq("GET", "/api/filetree/index/"+ref, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == 200:
+		out := map[string]string{}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("failed to fetch index for ref=%v: %s", ref, body)
+	}
 }
 
 // Refs returns a "snapshot" of the FS
