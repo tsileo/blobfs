@@ -604,6 +604,91 @@ func (f *FS) Refs(rootDir *Dir) ([]string, error) {
 
 //
 func (f *FS) Pull() error {
+	// First, try to fetch the local root
+	var err error
+	var remoteRoot *root.Root
+	var remoteNode Node
+
+	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
+	// localFsName := fmt.Sprintf(localRootKeyFmt, f.Name())
+
+	f.log.Debug("load latest remote mutation")
+	localKv, err := f.lkv.Get(fsName, -1)
+	switch err {
+	case nil:
+	case vkv.ErrNotFound:
+	default:
+		return err
+	}
+
+	// Then, try to fetch the remote root
+	f.log.Debug("load latest remote mutation")
+	remoteKv, err := f.rkv.Get(fsName, -1)
+	switch err {
+	case nil:
+		// There are mutations for this FS in BlobStash
+		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data, remoteKv.Version)
+	case kvstore.ErrKeyNotFound:
+		// The FS is new, no remote mutation nor local, we'll create the inital root later
+	default:
+		f.log.Error("failed to fetch lastest mutation from BlobStash", "err", err)
+		return err
+	}
+
+	switch {
+	case localKv == nil:
+		if remoteKv != nil {
+			// Fetch and save all the known remote mutations
+			versions, err := f.rkv.Versions(fsName, 0, -1, 0)
+			if err != nil {
+				return err
+			}
+			for _, version := range versions.Versions {
+				if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
+					return err
+				}
+			}
+			f.remote = &Mount{
+				immutable: f.Immutable(),
+				root:      remoteRoot,
+				node:      remoteNode,
+			}
+			return nil
+		}
+
+	case remoteKv == nil:
+		f.log.Info("FS does not exist remotely")
+
+	case remoteKv.Version > localKv.Version:
+		// Check we have mutation not synced yet
+		if f.local != nil && f.local.root.Version > localKv.Version {
+			// FIXME(tsileo): do a merge, create a new mount and set it as local
+			return nil
+		}
+
+		// No un-synced mutation, just copy the new mutations
+		versions, err := f.rkv.Versions(fsName, localKv.Version-1, -1, 0)
+		if err != nil {
+			return err
+		}
+		for _, version := range versions.Versions {
+			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
+				return err
+			}
+		}
+
+		f.remote = &Mount{
+			immutable: f.Immutable(),
+			root:      remoteRoot,
+			node:      remoteNode,
+		}
+
+	case remoteKv.Version < localKv.Version:
+		return fmt.Errorf("BlobStash seems out of sync")
+	case localKv.Version == remoteKv.Version:
+		f.log.Info("Already in sync")
+	}
+
 	return nil
 }
 
@@ -659,6 +744,11 @@ func (f *FS) Push() error {
 	// Set a KV entry for this mutation
 	// FIXME(tsileo): conditional request to ensure the previous version is the same
 	if _, err := bfs.rkv.Put(fsName, "", jsRoot, croot.Version); err != nil {
+		f.log.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
+		return err
+	}
+	// Save the mutation as remote locally  too
+	if _, err := bfs.lkv.Put(fsName, "", jsRoot, croot.Version); err != nil {
 		f.log.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 		return err
 	}
@@ -782,6 +872,7 @@ func (f *FS) loadRoot() error {
 			return fmt.Errorf("BlobStash instance seems out of sync, version mismatch")
 		} else {
 			// FIXME(tsileo): not only save the last, but all the missing one
+
 			localKv, err = f.lkv.Put(fsName, remoteKv.Hash, remoteKv.Data, remoteKv.Version)
 			if err != nil {
 				return err
@@ -794,12 +885,17 @@ func (f *FS) loadRoot() error {
 			return nil
 		}
 	case remoteKv != nil && localKv == nil:
-		// FIXME(tsileo): should load ALL the existing mutations
-		f.log.Debug("Saving the latest entry locally")
-		localKv, err = f.lkv.Put(fsName, remoteKv.Hash, remoteKv.Data, remoteKv.Version)
+		f.log.Debug("Saving the remote mutations locally")
+		versions, err := f.rkv.Versions(fsName, 0, -1, 0)
 		if err != nil {
 			return err
 		}
+		for _, version := range versions.Versions {
+			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
+				return err
+			}
+		}
+
 		f.remote = &Mount{
 			immutable: f.Immutable(),
 			node:      remoteNode,
