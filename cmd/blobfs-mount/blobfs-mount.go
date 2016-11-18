@@ -403,6 +403,10 @@ func main() {
 			select {
 			case <-bfs.sync:
 				fslog.Info("Sync triggered")
+				// FIXME(tsileo): do a pull before
+				if err := bfs.Push(); err != nil {
+					fslog.Error("failed to push", "err", err)
+				}
 			}
 		}
 	}()
@@ -896,6 +900,7 @@ func (f *FS) loadRoot() error {
 	case nil:
 		// There are mutations for this FS in BlobStash
 		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data, remoteKv.Version)
+		f.log.Debug("remote node", "node", remoteNode)
 	case kvstore.ErrKeyNotFound:
 		// The FS is new, no remote mutation nor local, we'll create the inital root later
 	default:
@@ -1818,6 +1823,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 		var err error
 		f.data, err = ioutil.ReadAll(f.FakeFile)
 		if err != nil {
+			f.log.Error("failed to read", "err", err)
 			return nil, err
 		}
 	}
