@@ -92,6 +92,7 @@ type API struct {
 func (api *API) Serve(socketPath string) error {
 	http.HandleFunc("/ref", apiRefHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
+	http.HandleFunc("/pull", apiPullHandler)
 	// http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
 	l, err := net.Listen("unix", socketPath)
@@ -149,6 +150,17 @@ func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bfs.sync <- struct{}{}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func apiPullHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := bfs.Pull(); err != nil {
+		panic(err)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -316,7 +328,7 @@ func main() {
 	// 	}
 	// }()
 
-	sockPath := fmt.Sprintf("/tmp/blobfs_%s.sock", name)
+	sockPath := fmt.Sprintf("/tmp/blobfs_%s_%d.sock", name, time.Now().Unix())
 
 	go func() {
 		api := &API{}
@@ -330,7 +342,7 @@ func main() {
 	fslog.Info("Mouting fs...", "mountpoint", mountpoint, "immutable", *immutablePtr)
 	bsOpts := blobstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
 	bsOpts.SnappyCompression = false
-	bs, err := cache.New(bsOpts, fmt.Sprintf("blobfs_cache_%s", name))
+	bs, err := cache.New(fslog.New("module", "blobstore"), bsOpts, fmt.Sprintf("blobfs_cache_%s", name))
 	if err != nil {
 		fslog.Crit("failed to init cache", "err", err)
 		os.Exit(1)
@@ -403,7 +415,9 @@ func main() {
 			select {
 			case <-bfs.sync:
 				fslog.Info("Sync triggered")
-				// FIXME(tsileo): do a pull before
+				if err := bfs.Pull(); err != nil {
+					fslog.Error("failed to push", "err", err)
+				}
 				if err := bfs.Push(); err != nil {
 					fslog.Error("failed to push", "err", err)
 				}
@@ -689,19 +703,23 @@ func (f *FS) Pull() error {
 	localKv, err := f.lkv.Get(fsName, -1)
 	switch err {
 	case nil:
+		f.log.Debug("loaded", "kv", string(localKv.Data))
 	case vkv.ErrNotFound:
+		f.log.Debug("not found")
 	default:
 		return err
 	}
 
 	// Then, try to fetch the remote root
-	f.log.Debug("load latest remote mutation")
+	f.log.Debug("load latest local mutation")
 	remoteKv, err := f.rkv.Get(fsName, -1)
 	switch err {
 	case nil:
+		f.log.Debug("loaded", "kv", string(remoteKv.Data))
 		// There are mutations for this FS in BlobStash
 		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data, remoteKv.Version)
 	case kvstore.ErrKeyNotFound:
+		f.log.Debug("not found")
 		// The FS is new, no remote mutation nor local, we'll create the inital root later
 	default:
 		f.log.Error("failed to fetch lastest mutation from BlobStash", "err", err)
@@ -1582,6 +1600,7 @@ func (f *File) Save() error {
 	}
 
 	// Update the new `Meta`
+	f.log.Debug("OP Save", "meta", f.meta)
 	f.parent.fs.uploader.PutMeta(f.meta)
 	// And save the parent
 	// f.parent.mu.Lock()
@@ -1857,10 +1876,11 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 			}
 			// f.parent.mu.Lock()
 			// defer f.parent.mu.Unlock()
-			if err := f.parent.Save(); err != nil {
+			f.meta = m2
+			if err := f.Save(); err != nil {
 				return err
 			}
-			f.meta = m2
+
 			// f.log = f.log.New("ref", m2.Hash[:10])
 			f.log.Debug("Flushed", "data_len", len(f.data))
 			f.state.updated = false
