@@ -254,7 +254,6 @@ try:
 
         f3.write(f3_content)
 
-    print 'f3'
     with open(os.path.join(mnt, f3_name)) as f3:
         assert f3.read() == f3_content * 2
 
@@ -306,12 +305,7 @@ try:
     print 'restart'
     blobfs.restart(remove_data=True)
 
-    print 'tree'
-    print check_output(['tree'], cwd=mnt)
-
-    print 'f1'
     f1.read_and_check()
-    print 'f2'
     f2.read_and_check()
 
     # TODO(tsileo): enable this on console flag to "test" new test more easily
