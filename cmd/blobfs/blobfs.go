@@ -129,7 +129,7 @@ func main() {
 		return
 	}
 	if err != nil {
-		panic(err)
+		// panic(err)
 	}
 	url := string(u)
 	switch cmd {
@@ -143,6 +143,10 @@ func main() {
 		}
 	case "sync", "push":
 		if err := Sync(client, url); err != nil {
+			panic(err)
+		}
+	case "fetch", "pull":
+		if err := Pull(client, url); err != nil {
 			panic(err)
 		}
 	case "share":
@@ -285,6 +289,21 @@ func buildStatusIndex(in []string) map[string]struct{} {
 // 	}
 // 	return nil
 // }
+
+func Pull(client http.Client, u string) error {
+	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/pull"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 204 {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	return nil
+}
 
 func Sync(client http.Client, u string) error {
 	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), nil)
