@@ -49,6 +49,7 @@ class BlobStash(object):
             self.process.terminate()
             self.process.wait()
 
+
 class BlobFS(object):
     def __init__(self, rebuild=True):
         self.process = None
@@ -65,6 +66,11 @@ class BlobFS(object):
         if p.wait():
             raise Exception('failed')
 
+        p = Popen(['go', 'install', 'github.com/tsileo/blobfs/cmd/blobfs'], env=os.environ)
+        if p.wait():
+            raise Exception('failed')
+
+
     def mount(self):
         """Execute `blobsfs-mount {fs_name} {fs_name}` and return the running process."""
         self.process = Popen(['./blobfs-mount', '-loglevel', 'debug', self.fs_name, self.fs_name])
@@ -76,6 +82,7 @@ class BlobFS(object):
         """Cleanup func."""
         try:
             os.remove('/tmp/blobfs_{}.sock'.format(self.fs_name))
+            shutil.rmtree()
         except:
             pass
 
@@ -84,6 +91,25 @@ class BlobFS(object):
         if self.process:
             self.process.terminate()
             self.process.wait()
+
+    def remove_data(self):
+        shutil.rmtree(self._var_dir())
+
+    def _var_dir(self):
+        blobfs_var_dir = os.environ.get('BLOBFS_VAR_DIR')
+        if blobfs_var_dir:
+            return blobfs_var_dir
+        return os.path.join(os.environ['HOME'], 'var', 'blobfs')
+
+    def restart(self, remove_data=False):
+        try:
+            self.unmount()
+        except OSError as exc:
+            print 'Failed',  exc
+        self.cleanup()
+        if remove_data:
+            self.remove_data()
+        self.mount()
 
 
 class File(object):
@@ -191,7 +217,6 @@ blobfs = BlobFS()
 blobfs.cleanup()
 
 mnt = blobfs.mnt
-mnt = blobfs.mnt
 blobfs.mount()
 
 try:
@@ -229,7 +254,7 @@ try:
 
         f3.write(f3_content)
 
-    # time.sleep(0.5)
+    print 'f3'
     with open(os.path.join(mnt, f3_name)) as f3:
         assert f3.read() == f3_content * 2
 
@@ -274,9 +299,26 @@ try:
 
     f2.read_and_check()
 
+    print 'sync'
+    check_output(['blobfs', 'sync'], cwd=mnt)
+    time.sleep(2)
+
+    print 'restart'
+    blobfs.restart(remove_data=True)
+
+    print 'tree'
+    print check_output(['tree'], cwd=mnt)
+
+    print 'f1'
+    f1.read_and_check()
+    print 'f2'
+    f2.read_and_check()
+
     # TODO(tsileo): enable this on console flag to "test" new test more easily
     # from IPython import embed; embed()
 
 finally:
     blobfs.unmount()
+    blobfs.remove_data()
+    os.rmdir(mnt)
     blobstash.shutdown()
