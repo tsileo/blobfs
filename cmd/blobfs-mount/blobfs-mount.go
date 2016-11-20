@@ -398,6 +398,7 @@ func main() {
 		socketPath: sockPath,
 		name:       name,
 		bs:         bs,
+		c:          c,
 		uid:        uint32(iuid),
 		gid:        uint32(igid),
 		lkv:        lkv,
@@ -468,7 +469,7 @@ func (f *FS) initRoot() (*Dir, error) {
 	newRoot := &Dir{
 		fs:       f,
 		Children: map[string]Node{},
-		meta:     &meta.Meta{Name: "_root"},
+		meta:     &meta.Meta{Name: ""},
 	}
 	newRoot.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 	if err := newRoot.Save(); err != nil {
@@ -531,6 +532,8 @@ func (f *debugFile) ReadAll(ctx context.Context) ([]byte, error) {
 type FS struct {
 	log log15.Logger
 
+	root *Dir
+
 	rkv *kvstore.KvStore // remote vkv store
 	lkv *vkv.DB          // local vkv store
 
@@ -549,6 +552,8 @@ type FS struct {
 	local  *Mount
 	remote *Mount
 
+	c *fuse.Conn
+
 	uid uint32 // Current user uid
 	gid uint32 // Current user gid
 
@@ -560,7 +565,7 @@ func (f *FS) Mount() *Mount {
 		if f.remote == nil || (f.remote != nil && f.local.root.Version > f.remote.root.Version) {
 			return f.local
 		}
-		return f.local
+		return f.local // FIXME(tsileo): or f.remote
 	}
 	return f.remote
 }
@@ -592,7 +597,7 @@ func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
 		switch n := node.(type) {
 		case *File:
 			path := ""
-			if n.parent.meta.Name != "_root" {
+			if n.parent.meta.Name != "" {
 				p1 := n.parent
 				for p1.parent != nil {
 					path = filepath.Join(path, p1.meta.Name)
@@ -702,29 +707,29 @@ func (f *FS) Pull() error {
 	// localFsName := fmt.Sprintf(localRootKeyFmt, f.Name())
 
 	f.log.Debug("load latest remote mutation", "name", fsName)
-	localKv, err := f.lkv.Get(fsName, -1)
+	remoteKv, err := f.rkv.Get(fsName, -1)
 	switch err {
 	case nil:
-		f.log.Debug("loaded", "kv", string(localKv.Data))
-	case vkv.ErrNotFound:
-		f.log.Debug("not found")
+		f.log.Debug("loaded remote", "kv", string(remoteKv.Data))
+		// There are mutations for this FS in BlobStash
+		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data, remoteKv.Version)
+	case kvstore.ErrKeyNotFound:
+		f.log.Debug("remote not found")
+		// The FS is new, no remote mutation nor local, we'll create the inital root later
 	default:
+		f.log.Error("failed to fetch lastest mutation from BlobStash", "err", err)
 		return err
 	}
 
 	// Then, try to fetch the remote root
 	f.log.Debug("load latest local mutation")
-	remoteKv, err := f.rkv.Get(fsName, -1)
+	localKv, err := f.lkv.Get(fsName, -1)
 	switch err {
 	case nil:
-		f.log.Debug("loaded", "kv", string(remoteKv.Data))
-		// There are mutations for this FS in BlobStash
-		remoteRoot, remoteNode, err = f.kvDataToDir(remoteKv.Data, remoteKv.Version)
-	case kvstore.ErrKeyNotFound:
-		f.log.Debug("not found")
-		// The FS is new, no remote mutation nor local, we'll create the inital root later
+		f.log.Debug("loaded local", "kv", string(localKv.Data))
+	case vkv.ErrNotFound:
+		f.log.Debug("local not found")
 	default:
-		f.log.Error("failed to fetch lastest mutation from BlobStash", "err", err)
 		return err
 	}
 
@@ -737,6 +742,7 @@ func (f *FS) Pull() error {
 				return err
 			}
 			for _, version := range versions.Versions {
+				f.log.Debug("Saving mutation locally", "root", string(version.Data))
 				if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
 					return err
 				}
@@ -746,6 +752,11 @@ func (f *FS) Pull() error {
 				root:      remoteRoot,
 				node:      remoteNode,
 			}
+			*f.root = *remoteNode.(*Dir)
+			// if err := bfs.c.InvalidateEntry(fuse.RootID, ""); err != nil {
+			// 	f.log.Error("failed to invalidate entry", "err", err)
+			// 	return err
+			// }
 			return nil
 		}
 
@@ -836,7 +847,7 @@ func (f *FS) Push() error {
 	}
 	// Set a KV entry for this mutation
 	// FIXME(tsileo): conditional request to ensure the previous version is the same
-	f.log.Debug("saving the mutation remotely", "name", fsName, "version", croot.Version)
+	f.log.Debug("saving the mutation remotely", "name", fsName, "version", croot.Version, "ref", croot.Ref)
 	if _, err := bfs.rkv.Put(fsName, "", jsRoot, croot.Version); err != nil {
 		f.log.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 		return err
@@ -951,6 +962,7 @@ func (f *FS) loadRoot() error {
 			root:      localRoot,
 			node:      newRoot,
 		}
+		f.root = f.Mount().node.(*Dir)
 		return nil
 	case localKv != nil && remoteKv != nil:
 		if localRoot.Version == remoteRoot.Version {
@@ -977,6 +989,7 @@ func (f *FS) loadRoot() error {
 				node:      remoteNode,
 				root:      remoteRoot,
 			}
+			f.root = f.Mount().node.(*Dir)
 			return nil
 		}
 	case remoteKv != nil && localKv == nil:
@@ -996,6 +1009,7 @@ func (f *FS) loadRoot() error {
 			node:      remoteNode,
 			root:      remoteRoot,
 		}
+		f.root = f.Mount().node.(*Dir)
 		return nil
 	}
 	return fmt.Errorf("shouldn't happen")
@@ -1419,6 +1433,10 @@ func (d *Dir) Save() error {
 			root:      root,
 			node:      d,
 		}
+		d.log.Debug("Current root", "root", d.fs.root, "new", d)
+		// if d.fs.root != nil {
+		// 	*d.fs.root = *d
+		// }
 	} else {
 		// d.parent.mu.Lock()
 		// defer d.parent.mu.Unlock()

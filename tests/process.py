@@ -35,9 +35,11 @@ class BlobStash(object):
 
 
 class BlobFS(object):
-    def __init__(self, rebuild=True):
+    def __init__(self, fs_name=None, rebuild=True):
         self.process = None
-        self.fs_name = random_name()
+        if not fs_name:
+            fs_name = random_name()
+        self.fs_name = fs_name
 
         if rebuild:
             self._build()
