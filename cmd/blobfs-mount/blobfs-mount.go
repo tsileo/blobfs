@@ -149,7 +149,9 @@ func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
 		return
 	}
-	bfs.sync <- struct{}{}
+	if err := bfs.Push(); err != nil {
+		panic(err)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -699,7 +701,7 @@ func (f *FS) Pull() error {
 	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
 	// localFsName := fmt.Sprintf(localRootKeyFmt, f.Name())
 
-	f.log.Debug("load latest remote mutation")
+	f.log.Debug("load latest remote mutation", "name", fsName)
 	localKv, err := f.lkv.Get(fsName, -1)
 	switch err {
 	case nil:
@@ -834,6 +836,7 @@ func (f *FS) Push() error {
 	}
 	// Set a KV entry for this mutation
 	// FIXME(tsileo): conditional request to ensure the previous version is the same
+	f.log.Debug("saving the mutation remotely", "name", fsName, "version", croot.Version)
 	if _, err := bfs.rkv.Put(fsName, "", jsRoot, croot.Version); err != nil {
 		f.log.Error("Sync failed (failed to update the remote vkv entry)", "err", err)
 		return err

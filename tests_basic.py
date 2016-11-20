@@ -108,7 +108,6 @@ try:
 
     print 'sync'
     print blobfs.cmd('sync')
-    time.sleep(2)
 
     print 'restart'
     blobfs.restart(remove_data=True)
