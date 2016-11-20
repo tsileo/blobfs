@@ -40,6 +40,16 @@ try:
     f2_1 = File(os.path.join(mnt2, f1_1.basename), f1_1.hexhash)
     f2_1.read_and_check()
 
+    f2_2 = root_dir2.create_file()
+    f2_2.read_and_check()
+
+    print blobfs2.cmd('sync')
+    print 'FETCH'
+    print blobfs1.cmd('fetch')
+
+    f1_2 = File(os.path.join(mnt1, f2_2.basename), f2_2.hexhash)
+    f1_2.read_and_check()
+
 finally:
     blobfs1.unmount()
     blobfs1.cleanup()

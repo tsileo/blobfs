@@ -565,7 +565,7 @@ func (f *FS) Mount() *Mount {
 		if f.remote == nil || (f.remote != nil && f.local.root.Version > f.remote.root.Version) {
 			return f.local
 		}
-		return f.local // FIXME(tsileo): or f.remote
+		return f.remote
 	}
 	return f.remote
 }
@@ -776,6 +776,9 @@ func (f *FS) Pull() error {
 			return err
 		}
 		for _, version := range versions.Versions {
+			if f.remote != nil && version.Version == f.remote.root.Version {
+				break
+			}
 			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
 				return err
 			}
@@ -786,6 +789,7 @@ func (f *FS) Pull() error {
 			root:      remoteRoot,
 			node:      remoteNode,
 		}
+		*f.root = *remoteNode.(*Dir)
 
 	case remoteKv.Version < localKv.Version:
 		return fmt.Errorf("BlobStash seems out of sync")
@@ -802,6 +806,35 @@ func (f *FS) Push() error {
 
 	wg.Add(1)
 	defer wg.Done()
+
+	// Ensure the current root is a local one
+	if f.Mount().root.Ref != f.local.root.Ref {
+		f.log.Info("No local changes")
+		return nil
+	}
+
+	// Check if the latest remote mutation
+	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
+	remoteKv, err := f.rkv.Get(fsName, -1)
+	switch err {
+	case nil:
+		// There are mutations for this FS in BlobStash
+		remoteRoot, remoteNode, err := f.kvDataToDir(remoteKv.Data, remoteKv.Version)
+		f.log.Debug("remote node", "node", remoteNode)
+		if err != nil {
+			return err
+		}
+		if remoteRoot.Ref != f.remote.root.Ref {
+			f.log.Error("conflicted")
+			// FIXME(tsileo): return conflicted error
+			return nil
+		}
+	case kvstore.ErrKeyNotFound:
+		// The FS is new, no remote mutation nor local, we'll create the inital root later
+	default:
+		f.log.Error("failed to fetch lastest mutation from BlobStash", "err", err)
+		return err
+	}
 
 	// Keep some basic stats about the on-going sync
 	stats := &SyncStats{}
@@ -840,7 +873,6 @@ func (f *FS) Push() error {
 		}
 	}
 
-	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
 	jsRoot, err := croot.JSON()
 	if err != nil {
 		return err
