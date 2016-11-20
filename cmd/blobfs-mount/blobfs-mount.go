@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -570,6 +571,60 @@ func (f *FS) Mount() *Mount {
 	return f.remote
 }
 
+func (f *FS) localIndex() (map[string]string, error) {
+	return f.buildLocalIndex(f.root, "/")
+}
+
+func (f *FS) buildLocalIndex(n Node, p string) (map[string]string, error) {
+	index := map[string]string{}
+	index[filepath.Join(p, n.Meta().Name)] = n.Meta().Hash
+	if n.IsDir() {
+		d := n.(*Dir)
+		if d.Children == nil {
+			if err := d.reload(); err != nil {
+				return nil, err
+			}
+		}
+		for _, child := range d.Children {
+			if child.IsDir() {
+				childIndex, err := f.buildLocalIndex(child, filepath.Join(p, n.Meta().Name))
+				if err != nil {
+					return nil, err
+				}
+				for cp, cref := range childIndex {
+					index[cp] = cref
+				}
+			} else {
+				index[filepath.Join(p, n.Meta().Name, child.Meta().Name)] = child.Meta().Hash
+			}
+		}
+	}
+	return index, nil
+}
+
+type DiffNode struct {
+	Path, Hash string
+}
+
+type Diff struct {
+	Added []*DiffNode
+}
+
+func (f *FS) compareIndex(localIndex, remoteIndex map[string]string) (*Diff, error) {
+	if _, ok := remoteIndex["/"]; ok {
+		delete(remoteIndex, "/")
+	}
+	diff := &Diff{
+		Added: []*DiffNode{},
+	}
+	for p, ref := range remoteIndex {
+		if _, ok := localIndex[p]; !ok {
+			diff.Added = append(diff.Added, &DiffNode{p, ref})
+		}
+	}
+	return diff, nil
+}
+
 func (f *FS) updateLastOP() {
 	f.lastOP = time.Now()
 }
@@ -764,17 +819,14 @@ func (f *FS) Pull() error {
 		f.log.Info("FS does not exist remotely")
 
 	case remoteKv.Version > localKv.Version:
-		// Check we have mutation not synced yet
-		if f.local != nil && f.local.root.Version > localKv.Version {
-			// FIXME(tsileo): do a merge, create a new mount and set it as local
-			return nil
-		}
-
 		// No un-synced mutation, just copy the new mutations
 		versions, err := f.rkv.Versions(fsName, localKv.Version-1, -1, 0)
 		if err != nil {
 			return err
 		}
+
+		// FIXME(tsileo): assert that the latest remote (the one stored locally) ref is
+		// actually present in the old versions
 		for _, version := range versions.Versions {
 			if f.remote != nil && version.Version == f.remote.root.Version {
 				break
@@ -782,6 +834,51 @@ func (f *FS) Pull() error {
 			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
 				return err
 			}
+		}
+
+		// Check we have mutation not synced yet
+		if f.local != nil && f.local.root.Version > localKv.Version {
+			// Conflict handling
+
+			// FIXME(tsileo): do a merge, create a new mount and set it as local
+			f.log.Info("There is a conflict")
+
+			remoteIndex, err := f.remoteIndex(remoteRoot.Ref)
+			if err != nil {
+				return err
+			}
+			f.log.Info("Fetched remote index", "index", remoteIndex)
+			localIndex, err := f.localIndex()
+			if err != nil {
+				return err
+			}
+			f.log.Info("Built remote index", "index", localIndex)
+			diff, err := f.compareIndex(localIndex, remoteIndex)
+			if err != nil {
+				return err
+			}
+			f.log.Info("Computed diff", "diff", diff)
+
+			for _, added := range diff.Added {
+				f.log.Info("[add]", "node", added)
+				blob, err := f.bs.Get(context.TODO(), added.Hash)
+				if err != nil {
+					return err
+				}
+				// Decode it as a Meta
+				m, err := meta.NewMetaFromBlob(added.Hash, blob)
+				if err != nil {
+					return err
+				}
+				if err := f.createNode(added.Path, m); err != nil {
+					return err
+				}
+			}
+
+			*f.root = *f.local.node.(*Dir)
+			f.log.Info("Diff done")
+
+			return nil
 		}
 
 		f.remote = &Mount{
@@ -797,6 +894,50 @@ func (f *FS) Pull() error {
 		f.log.Info("Already in sync")
 	}
 
+	return nil
+}
+
+func (f *FS) createNode(path string, cmeta *meta.Meta) error {
+	var prev *Dir
+	split := strings.Split(path[1:], "/")
+	pathCount := len(split)
+	node := f.root
+	for i, p := range split {
+		if node.Children == nil {
+			if err := node.reload(); err != nil {
+				return err
+			}
+		}
+		prev = node
+		child, ok := node.Children[p]
+		if ok {
+			node = child.(*Dir)
+			continue
+		}
+
+		if i == pathCount-1 {
+			nfile, err := NewFile(f, cmeta, node)
+			if err != nil {
+				return err
+			}
+			node.Children[p] = nfile
+			if err := node.Save(); err != nil {
+				return err
+			}
+
+		} else {
+			newMeta := &meta.Meta{
+				Type: "dir",
+				Name: p,
+			}
+			newd, err := NewDir(f, newMeta, prev)
+			if err != nil {
+				return err
+			}
+			node.Children[p] = newd
+			node = newd
+		}
+	}
 	return nil
 }
 
@@ -826,7 +967,7 @@ func (f *FS) Push() error {
 		}
 		if remoteRoot.Ref != f.remote.root.Ref {
 			f.log.Error("conflicted")
-			// FIXME(tsileo): return conflicted error
+			// FIXME(tsileo): return conflicted error asking to pull
 			return nil
 		}
 	case kvstore.ErrKeyNotFound:

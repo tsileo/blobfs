@@ -53,6 +53,22 @@ try:
     f1_2 = File(os.path.join(mnt1, f2_2.basename), f2_2.hexhash)
     f1_2.read_and_check()
 
+    f1_3 = root_dir1.create_file()
+    f1_3.read_and_check()
+
+    print blobfs1.cmd('sync')
+
+    f2_4 = root_dir2.create_file()
+    f2_4.read_and_check()
+
+    print blobfs2.cmd('fetch')
+
+    f2_3 = File(os.path.join(mnt2, f1_3.basename), f1_3.hexhash)
+    f2_3.read_and_check()
+
+    # TODO(tsileo): make a sync and ensure f2_4 can be read by fs1
+
+
 finally:
     blobfs1.unmount()
     blobfs1.cleanup()
