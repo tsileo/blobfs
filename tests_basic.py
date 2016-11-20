@@ -6,7 +6,7 @@ A proper POSIX test suite may be added later once more features/calls are implem
 """
 import logging
 import os
-import time
+import sys
 
 from tests.node import Dir
 from tests.node import random_name
@@ -16,6 +16,9 @@ from tests.process import BlobStash
 # TODO(tsileo): use pytest with custom error?
 # TODO(tsileo): test that we can read the `.blobfs_socket` file
 
+DEBUG = False
+if len(sys.argv) > 1:
+    DEBUG = True
 
 blobstash = BlobStash()
 blobstash.cleanup()
@@ -24,7 +27,7 @@ blobstash.run()
 
 blobfs = BlobFS()
 
-blobfs.mount()
+blobfs.mount(debug=DEBUG)
 mnt = blobfs.mnt
 
 try:

@@ -1,6 +1,6 @@
 # coding: utf-8
 import os
-import time
+import sys
 
 from tests.node import File
 from tests.node import Dir
@@ -11,6 +11,9 @@ from tests.process import BlobStash
 # TODO(tsileo): use pytest with custom error?
 # TODO(tsileo): test that we can read the `.blobfs_socket` file
 
+DEBUG = False
+if len(sys.argv) > 1:
+    DEBUG = True
 
 blobstash = BlobStash()
 blobstash.cleanup()
@@ -18,11 +21,11 @@ blobstash.cleanup()
 blobstash.run()
 
 blobfs1 = BlobFS()
-blobfs1.mount(random_name())
+blobfs1.mount(random_name(), debug=DEBUG)
 mnt1 = blobfs1.mnt
 
 blobfs2 = BlobFS(blobfs1.fs_name)
-blobfs2.mount(random_name())
+blobfs2.mount(random_name(), debug=DEBUG)
 mnt2 = blobfs2.mnt
 
 

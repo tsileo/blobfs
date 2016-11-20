@@ -54,7 +54,7 @@ class BlobFS(object):
         if p.wait():
             raise Exception('failed')
 
-    def mount(self, mountpoint=None):
+    def mount(self, mountpoint=None, debug=False):
         """Execute `blobsfs-mount {fs_name} {fs_name}` and return the running process."""
         if not mountpoint:
             mountpoint = self.fs_name
@@ -67,7 +67,11 @@ class BlobFS(object):
             os.makedirs(self.var_dir)
         env = dict(os.environ)
         env['BLOBFS_VAR_DIR'] = self.var_dir
-        self.process = Popen(['./blobfs-mount', '-loglevel', 'debug', self.fs_name, mountpoint], env=env)
+        process_args = ['./blobfs-mount']
+        if debug:
+            process_args.extend(['-loglevel', 'debug'])
+        process_args.extend([self.fs_name, mountpoint])
+        self.process = Popen(process_args, env=env)
         time.sleep(1)
         if self.process.poll():
             raise Exception('failed to mount')
