@@ -15,6 +15,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -607,19 +608,38 @@ type DiffNode struct {
 }
 
 type Diff struct {
-	Added []*DiffNode
+	Added      []*DiffNode
+	Conflicted []*DiffNode
+	Deleted    []*DiffNode
 }
 
 func (f *FS) compareIndex(localIndex, remoteIndex map[string]string) (*Diff, error) {
 	if _, ok := remoteIndex["/"]; ok {
 		delete(remoteIndex, "/")
 	}
+	if _, ok := localIndex["/"]; ok {
+		delete(localIndex, "/")
+	}
 	diff := &Diff{
-		Added: []*DiffNode{},
+		Added:      []*DiffNode{},
+		Conflicted: []*DiffNode{},
+		Deleted:    []*DiffNode{},
 	}
 	for p, ref := range remoteIndex {
-		if _, ok := localIndex[p]; !ok {
+		if lref, ok := localIndex[p]; ok {
+			// The file is also present in the local index
+			if ref != lref {
+				// The ref are different, there is a conflict
+				diff.Conflicted = append(diff.Conflicted, &DiffNode{p, ref})
+			}
+		} else {
+			// The file is not present in the local index, it has been "added"
 			diff.Added = append(diff.Added, &DiffNode{p, ref})
+		}
+	}
+	for p, _ := range localIndex {
+		if _, ok := remoteIndex[p]; !ok {
+			diff.Deleted = append(diff.Deleted, &DiffNode{p, ""})
 		}
 	}
 	return diff, nil
@@ -751,6 +771,18 @@ func (f *FS) Refs(rootDir *Dir) ([]string, error) {
 	return refs, nil
 }
 
+type ByLength []*DiffNode
+
+func (s ByLength) Len() int {
+	return len(s)
+}
+func (s ByLength) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+func (s ByLength) Less(i, j int) bool {
+	return len(strings.Split(s[i].Path, "/")) > len(strings.Split(s[j].Path, "/"))
+}
+
 //
 func (f *FS) Pull() error {
 	// First, try to fetch the local root
@@ -836,6 +868,7 @@ func (f *FS) Pull() error {
 			}
 		}
 
+		// FIXME(tsileo): check here too
 		// Check we have mutation not synced yet
 		if f.local != nil && f.local.root.Version > localKv.Version {
 			// Conflict handling
@@ -860,17 +893,34 @@ func (f *FS) Pull() error {
 			f.log.Info("Computed diff", "diff", diff)
 
 			for _, added := range diff.Added {
+				m, err := f.metaFromHash(added.Hash)
+				if err != nil {
+					return err
+				}
 				f.log.Info("[add]", "node", added)
-				blob, err := f.bs.Get(context.TODO(), added.Hash)
-				if err != nil {
-					return err
-				}
-				// Decode it as a Meta
-				m, err := meta.NewMetaFromBlob(added.Hash, blob)
-				if err != nil {
-					return err
-				}
 				if err := f.createNode(added.Path, m); err != nil {
+					return err
+				}
+			}
+
+			for _, conflicted := range diff.Conflicted {
+				m, err := f.metaFromHash(conflicted.Hash)
+				if err != nil {
+					return err
+				}
+				f.log.Info("[conflicted]", "node", conflicted)
+				if err := f.createNode(conflicted.Path+".conflicted", m); err != nil {
+					return err
+				}
+			}
+			// Make sure we handle the deepest children first so we don't delete a directory with a file not deleted yet
+			sort.Sort(ByLength(diff.Deleted))
+			for _, deleted := range diff.Deleted {
+				f.log.Info("[deleted]", "node", deleted)
+				// FIXME(tsileo): detect new file/unsynced file/if the deleted file has been modified
+				// XXX(tsileo): should check the latest remote (from local rkv) and see if the file is the same
+				// in this case delete it, if not ???
+				if err := f.deleteNode(deleted.Path); err != nil {
 					return err
 				}
 			}
@@ -894,6 +944,42 @@ func (f *FS) Pull() error {
 		f.log.Info("Already in sync")
 	}
 
+	return nil
+}
+
+func (f *FS) metaFromHash(hash string) (*meta.Meta, error) {
+	blob, err := f.bs.Get(context.TODO(), hash)
+	if err != nil {
+		return nil, err
+	}
+	// Decode it as a Meta
+	return meta.NewMetaFromBlob(hash, blob)
+}
+
+func (f *FS) deleteNode(path string) error {
+	split := strings.Split(path[1:], "/")
+	pathCount := len(split)
+	node := f.root
+	for i, p := range split {
+		if node.Children == nil {
+			if err := node.reload(); err != nil {
+				return err
+			}
+		}
+		child, ok := node.Children[p]
+		if ok {
+			if i == pathCount-1 {
+				delete(node.Children, p)
+				return node.Save()
+			}
+
+			// Keep searching
+			node = child.(*Dir)
+			continue
+		}
+
+		return fmt.Errorf("shouldn't happen")
+	}
 	return nil
 }
 
@@ -960,16 +1046,17 @@ func (f *FS) Push() error {
 	switch err {
 	case nil:
 		// There are mutations for this FS in BlobStash
-		remoteRoot, remoteNode, err := f.kvDataToDir(remoteKv.Data, remoteKv.Version)
+		_, remoteNode, err := f.kvDataToDir(remoteKv.Data, remoteKv.Version)
 		f.log.Debug("remote node", "node", remoteNode)
 		if err != nil {
 			return err
 		}
-		if remoteRoot.Ref != f.remote.root.Ref {
-			f.log.Error("conflicted")
-			// FIXME(tsileo): return conflicted error asking to pull
-			return nil
-		}
+		// FIXME(tsileo): better way to check
+		// if remoteRoot.Ref != f.remote.root.Ref {
+		// 	f.log.Error("conflicted")
+		// 	// FIXME(tsileo): return conflicted error asking to pull
+		// 	return nil
+		// }
 	case kvstore.ErrKeyNotFound:
 		// The FS is new, no remote mutation nor local, we'll create the inital root later
 	default:
@@ -1230,15 +1317,18 @@ func (d *Dir) reload() error {
 		if err != nil {
 			return err
 		}
+		d.log.Debug("fetched meta", "meta", m)
 		if m.IsDir() {
 			ndir, err := NewDir(d.fs, m, d)
 			if err != nil {
+				d.log.Error("failed to build dir", "err", err)
 				return err
 			}
 			d.Children[m.Name] = ndir
 		} else {
 			nfile, err := NewFile(d.fs, m, d)
 			if err != nil {
+				d.log.Error("failed to build file", "err", err)
 				return err
 			}
 			d.Children[m.Name] = nfile
