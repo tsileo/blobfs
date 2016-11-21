@@ -65,8 +65,12 @@ try:
 
         f3.write(f3_content)
 
+        # FIXME(tsileo): ensure f1_1
+
     with open(os.path.join(mnt, f3_name)) as f3:
         assert f3.read() == f3_content * 2
+
+    assert len(root_dir.list()) == 2
 
     d1 = root_dir.create_dir()
     # time.sleep(0.5)
@@ -102,12 +106,17 @@ try:
     f2.move(os.path.join(mnt, random_name()))
     # time.sleep(0.5)
 
+    assert len(root_dir.list()) == 4
+
     f2.read_and_check()
 
     f2.move(os.path.join(mnt, d1.basename, random_name()))
     # time.sleep(0.5)
 
+    assert len(root_dir.list()) == 3
+
     f2.read_and_check()
+
 
     print 'sync'
     print blobfs.cmd('sync')
@@ -117,6 +126,21 @@ try:
 
     f1.read_and_check()
     f2.read_and_check()
+
+    assert len(root_dir.list()) == 3
+
+    os.remove(f1.path)
+
+    eraised = False
+    try:
+        open(f1.path)
+    except IOError as exc:
+        eraised = True
+        assert exc.errno == 2
+
+    assert eraised
+
+    # FIXME(tsileo): test to remove a file and check the IOError
 
     # TODO(tsileo): enable this on console flag to "test" new test more easily
     # from IPython import embed; embed()
