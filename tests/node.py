@@ -104,8 +104,10 @@ class Dir(object):
         os.mkdir(path)
         return Dir(path)
 
-    def create_file(self, name=None, size=FILE_SIZE):
+    def create_file(self, name=None, size=FILE_SIZE, prefix=None):
         if name is None:
             name = random_name()
+        if prefix:
+            name = prefix + '_' + name
         path = os.path.join(self.path, name)
         return File.from_random(path)

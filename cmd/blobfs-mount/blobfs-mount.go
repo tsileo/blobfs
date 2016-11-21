@@ -637,11 +637,12 @@ func (f *FS) compareIndex(localIndex, remoteIndex map[string]string) (*Diff, err
 			diff.Added = append(diff.Added, &DiffNode{p, ref})
 		}
 	}
-	for p, _ := range localIndex {
-		if _, ok := remoteIndex[p]; !ok {
-			diff.Deleted = append(diff.Deleted, &DiffNode{p, ""})
-		}
-	}
+	// FIXME(tsileo): find a way to detect remote deletion
+	// for p, _ := range localIndex {
+	// 	if _, ok := remoteIndex[p]; !ok {
+	// 		diff.Deleted = append(diff.Deleted, &DiffNode{p, ""})
+	// 	}
+	// }
 	return diff, nil
 }
 
