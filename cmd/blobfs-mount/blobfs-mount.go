@@ -613,7 +613,7 @@ type Diff struct {
 	Deleted    []*DiffNode
 }
 
-func (f *FS) compareIndex(localIndex, remoteIndex map[string]string) (*Diff, error) {
+func (f *FS) compareIndex(localIndex, remoteIndex map[string]string, prevMutationRef string) (*Diff, error) {
 	if _, ok := remoteIndex["/"]; ok {
 		delete(remoteIndex, "/")
 	}
@@ -637,12 +637,20 @@ func (f *FS) compareIndex(localIndex, remoteIndex map[string]string) (*Diff, err
 			diff.Added = append(diff.Added, &DiffNode{p, ref})
 		}
 	}
-	// FIXME(tsileo): find a way to detect remote deletion
-	// for p, _ := range localIndex {
-	// 	if _, ok := remoteIndex[p]; !ok {
-	// 		diff.Deleted = append(diff.Deleted, &DiffNode{p, ""})
-	// 	}
-	// }
+	// If there is only one remote mutation, then all the deletedCandidates are new local files
+	if prevMutationRef != "" {
+		deletedCandidates := []*DiffNode{}
+		for p, ref := range localIndex {
+			if _, ok := remoteIndex[p]; !ok {
+				deletedCandidates = append(deletedCandidates, &DiffNode{p, ref})
+			}
+		}
+		// FIXME(tsileo): check at /api/filetree/fs/ref/{ref}+p
+		// if the node exists, compare the ref, if it's the same, we can delete the file
+		// safely (since it will be super easy to restore), it it's not the same,
+		// rename it as .conflicted+deleted
+	}
+	// FIXME(tsileo): check if there is a previous version
 	return diff, nil
 }
 

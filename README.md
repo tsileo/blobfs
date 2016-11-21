@@ -27,6 +27,7 @@ $ blobfs-mount documents ~/docs
 
 ## TODOs
 
+- [ ] undo cmd like the hammer filesystem
 - [ ] Better user support
 - [ ] Better attr support
 - [ ] A web UI (DropBox like, open source too) available on `my.blobfs.com` that connect to the user's BlobStash instance
