@@ -64,6 +64,7 @@ try:
     f1_2 = File(os.path.join(mnt1, f2_2.basename), f2_2.hexhash)
     f1_2.read_and_check()
 
+    # Create a new file
     f1_3 = root_dir1.create_file(prefix='f3')
     f1_3.read_and_check()
 
@@ -72,10 +73,6 @@ try:
     print blobfs1.cmd('sync')
 
     # Back to mount 2
-
-    f2_4 = root_dir2.create_file(prefix='f4')
-    f2_4.read_and_check()
-
     print 'MARK1', root_dir1.list()
     print 'MARK2', root_dir2.list()
 
@@ -89,25 +86,69 @@ try:
     f2_3 = File(os.path.join(mnt2, f1_3.basename), f1_3.hexhash)
     f2_3.read_and_check()
 
-    assert len(root_dir2.list()) == 4
+    assert len(root_dir2.list()) == 3
 #     os.remove(f2_1.path)
+
+    # Create another file
+    f2_4 = root_dir2.create_file(prefix='f4')
+    f2_4.read_and_check()
 
     print 'SYNC'
     print blobfs2.cmd('sync')
     print 'FETCH'
+
+    # Create another file to trigger a sync conflict
+    f1_5 = root_dir1.create_file(prefix='f5')
+    f1_5.read_and_check()
+
     print blobfs1.cmd('fetch')
 
     f1_1.read_and_check()
     f1_2.read_and_check()
     f1_3.read_and_check()
-    f1_1.read_and_check()
 
     print 'LEN', root_dir1.list(), f2_4.basename
 
+    # Ensure f4 has been pulled
     f1_4 = File(os.path.join(mnt1, f2_4.basename), f2_4.hexhash)
     f1_4.read_and_check()
 
-#     # FIXME(tsileo): ensure f1_1
+    # resync
+    print blobfs1.cmd('sync')
+    print blobfs2.cmd('fetch')
+
+    # Ensure f5 has been synced
+    f2_5 = File(os.path.join(mnt2, f1_5.basename), f1_5.hexhash)
+    f2_5.read_and_check()
+
+    # # Now both FS1 and FS2 are in sync, edit f1
+    # f1_1.edit()
+    # print 'EDIT'
+    # f1_1.print_debug()
+    # print
+    # print
+
+    # f1_1.read_and_check()
+
+    # print blobfs1.cmd('sync')
+
+    # # Now back to FS2, also edit f1 to trigger a conflicted
+    # print 'BEFORE FETCH'
+    # f2_1.edit()
+    # f2_1.print_debug()
+
+    # f2_1.read_and_check()
+
+    # print blobfs2.cmd('fetch')
+
+    # print 'f2_1'
+    # f2_1.print_debug()
+
+    # f2_1_conflicted = File(os.path.join(mnt2, f2_1.basename + '.conflicted'), f1_1.hexhash)
+    # f2_1_conflicted.print_debug()
+    # f2_1_conflicted.read_and_check()
+
+    # # FIXME(tsileo): add File.debug that dumps the meta (from HTTP socket API)
 
 finally:
     blobfs1.unmount()

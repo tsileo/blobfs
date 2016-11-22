@@ -1,9 +1,10 @@
 # coding: utf-8
-import os
 import hashlib
+import json
+import os
+import random
 import shutil
 import string
-import random
 
 FILE_SIZE = 3 * 2 ** 20  # 3MB file by default
 
@@ -19,6 +20,27 @@ class File(object):
         self.path = path
         self.hexhash = hexhash
         self.basename = os.path.basename(path)
+
+    @property
+    def meta(self):
+        """Output the file Meta"""
+        with open(self.path+'.blobfs_debug') as f:
+            payload = f.read()
+            meta = json.loads(payload[64:])
+            meta['hash'] = payload[0:63]
+            return meta
+
+    def print_debug(self):
+        print """##########
+Meta
+hash={hash}
+name={name}
+type={type}
+size={size}
+mtime={mtime}
+refs={refs}
+##########
+""".format(**self.meta)
 
     @staticmethod
     def _write_random_data(path, size=FILE_SIZE):
@@ -48,17 +70,21 @@ class File(object):
 
     def read_and_check(self):
         """Read the file and ensure the hexhash matches."""
+        print 'checking {}'.format(self.path)
+        size = 0
         with open(self.path, 'rb') as f:
             content = ''
             h = hashlib.sha1()
             while 1:
                 buf = f.read()
+                size += len(buf)
                 h.update(buf)
                 content += buf
                 if not buf:
                     break
             hexhash = h.hexdigest()
-
+        print 'size=', size
+        print hexhash, self.hexhash
         assert self.hexhash == hexhash
 
     def remove(self):
