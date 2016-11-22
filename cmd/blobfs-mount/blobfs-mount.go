@@ -51,6 +51,8 @@ import (
 // - a -no-startup-sync flag for offline use?
 // - a -cache mode
 
+const debugSuffix = ".blobfs_debug"
+
 const maxInt = int(^uint(0) >> 1)
 
 var virtualXAttrs = map[string]func(*meta.Meta) []byte{
@@ -514,9 +516,9 @@ type debugFile struct {
 	data []byte
 }
 
-func newDebugFile(data string) *debugFile {
+func newDebugFile(data []byte) *debugFile {
 	return &debugFile{
-		data: []byte(data),
+		data: data,
 	}
 }
 
@@ -608,12 +610,12 @@ type DiffNode struct {
 }
 
 type Diff struct {
-	Added      []*DiffNode
-	Conflicted []*DiffNode
-	Deleted    []*DiffNode
+	Added             []*DiffNode
+	Conflicted        []*DiffNode
+	DeletedCandidates []*DiffNode
 }
 
-func (f *FS) compareIndex(localIndex, remoteIndex map[string]string, prevMutationRef string) (*Diff, error) {
+func (f *FS) compareIndex(localIndex, remoteIndex map[string]string) (*Diff, error) {
 	if _, ok := remoteIndex["/"]; ok {
 		delete(remoteIndex, "/")
 	}
@@ -621,9 +623,9 @@ func (f *FS) compareIndex(localIndex, remoteIndex map[string]string, prevMutatio
 		delete(localIndex, "/")
 	}
 	diff := &Diff{
-		Added:      []*DiffNode{},
-		Conflicted: []*DiffNode{},
-		Deleted:    []*DiffNode{},
+		Added:             []*DiffNode{},
+		Conflicted:        []*DiffNode{},
+		DeletedCandidates: []*DiffNode{},
 	}
 	for p, ref := range remoteIndex {
 		if lref, ok := localIndex[p]; ok {
@@ -637,20 +639,14 @@ func (f *FS) compareIndex(localIndex, remoteIndex map[string]string, prevMutatio
 			diff.Added = append(diff.Added, &DiffNode{p, ref})
 		}
 	}
-	// If there is only one remote mutation, then all the deletedCandidates are new local files
-	if prevMutationRef != "" {
-		deletedCandidates := []*DiffNode{}
-		for p, ref := range localIndex {
-			if _, ok := remoteIndex[p]; !ok {
-				deletedCandidates = append(deletedCandidates, &DiffNode{p, ref})
-			}
+	for p, ref := range localIndex {
+		if _, ok := remoteIndex[p]; !ok {
+			diff.DeletedCandidates = append(diff.DeletedCandidates, &DiffNode{p, ref})
 		}
-		// FIXME(tsileo): check at /api/filetree/fs/ref/{ref}+p
-		// if the node exists, compare the ref, if it's the same, we can delete the file
-		// safely (since it will be super easy to restore), it it's not the same,
-		// rename it as .conflicted+deleted
 	}
-	// FIXME(tsileo): check if there is a previous version
+	// Make sure we handle the deepest children first so we don't delete a directory with a file not deleted yet
+	sort.Sort(ByLength(diff.DeletedCandidates))
+
 	return diff, nil
 }
 
@@ -715,6 +711,41 @@ func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
 	}
 	return root, index
 }
+
+// Same struct BlobStash's filetree.Node
+// XXX(tsileo): check if we can use a Meta for this? a meta never output hash/ref :s
+type RemoteNode struct {
+	Name     string  `json:"name"`
+	Type     string  `json:"type"`
+	Size     int     `json:"size"`
+	Mode     uint32  `json:"mode"`
+	ModTime  string  `json:"mtime"`
+	Hash     string  `json:"ref"`
+	Children []*Node `json:"children,omitempty"`
+}
+
+func (f *FS) remoteNode(mutationRef, path string) (*RemoteNode, error) {
+	resp, err := f.bs.Client().DoReq("GET", fmt.Sprintf("/api/filetree/fs/ref/%s/%s", mutationRef, path), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == 200:
+		node := &RemoteNode{}
+		if err := json.Unmarshal(body, &node); err != nil {
+			return nil, err
+		}
+		return node, nil
+	default:
+		return nil, fmt.Errorf("failed to fetch node at path \"%s\" for ref=%v: %s", path, mutationRef, body)
+	}
+}
+
 func (f *FS) remoteIndex(ref string) (map[string]string, error) {
 	resp, err := f.bs.Client().DoReq("GET", "/api/filetree/index/"+ref, nil, nil)
 	if err != nil {
@@ -861,21 +892,32 @@ func (f *FS) Pull() error {
 
 	case remoteKv.Version > localKv.Version:
 		// No un-synced mutation, just copy the new mutations
-		versions, err := f.rkv.Versions(fsName, localKv.Version-1, -1, 0)
+		// versions, err := f.rkv.Versions(fsName, localKv.Version-1, -1, 0)
+		versions, err := f.rkv.Versions(fsName, 0, -1, 0)
 		if err != nil {
 			return err
 		}
 
 		// FIXME(tsileo): assert that the latest remote (the one stored locally) ref is
 		// actually present in the old versions
+		// var lastRefData []byte
+		saved := 0
+		shouldBreak := false
 		for _, version := range versions.Versions {
-			if f.remote != nil && version.Version == f.remote.root.Version {
+			if shouldBreak {
 				break
+			}
+			if f.remote != nil && version.Version == f.remote.root.Version {
+				shouldBreak = true
+				// This mean we should catch the version as the previous ref
 			}
 			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
 				return err
 			}
+			saved++
 		}
+
+		f.log.Debug("Remote mutation saved", "count", saved)
 
 		// FIXME(tsileo): check here too
 		// Check we have mutation not synced yet
@@ -890,11 +932,14 @@ func (f *FS) Pull() error {
 				return err
 			}
 			f.log.Info("Fetched remote index", "index", remoteIndex)
+
 			localIndex, err := f.localIndex()
 			if err != nil {
 				return err
 			}
 			f.log.Info("Built remote index", "index", localIndex)
+
+			// Compute the diff between the two mutations
 			diff, err := f.compareIndex(localIndex, remoteIndex)
 			if err != nil {
 				return err
@@ -918,20 +963,31 @@ func (f *FS) Pull() error {
 					return err
 				}
 				f.log.Info("[conflicted]", "node", conflicted)
+				m.Name = m.Name + ".conflicted"
 				if err := f.createNode(conflicted.Path+".conflicted", m); err != nil {
 					return err
 				}
 			}
-			// Make sure we handle the deepest children first so we don't delete a directory with a file not deleted yet
-			sort.Sort(ByLength(diff.Deleted))
-			for _, deleted := range diff.Deleted {
-				f.log.Info("[deleted]", "node", deleted)
-				// FIXME(tsileo): detect new file/unsynced file/if the deleted file has been modified
-				// XXX(tsileo): should check the latest remote (from local rkv) and see if the file is the same
-				// in this case delete it, if not ???
-				if err := f.deleteNode(deleted.Path); err != nil {
-					return err
-				}
+			// If there is only one remote mutation, then all the deletedCandidates are new local files
+			// if prevMutationRef != "" {
+			// FIXME(tsileo): rename Diff.Deleted to Diff.DeletedCandidates and make the handling outside of this func
+			// then, check at /api/filetree/fs/ref/{ref}+p
+			// if the node exists, compare the ref, if it's the same, we can delete the file
+			// safely (since it will be super easy to restore), it it's not the same,
+			// rename it as .conflicted+deleted
+			// }
+			// FIXME(tsileo): check if there is a previous version
+
+			for _, deletedCandidate := range diff.DeletedCandidates {
+				// rnode, err := f.remoteNode()
+				f.log.Debug("[deleted *candidate*]", "node", deletedCandidate)
+				// 	f.log.Info("[deleted]", "node", deleted)
+				// 	// FIXME(tsileo): detect new file/unsynced file/if the deleted file has been modified
+				// 	// XXX(tsileo): should check the latest remote (from local rkv) and see if the file is the same
+				// 	// in this case delete it, if not ???
+				// 	if err := f.deleteNode(deleted.Path); err != nil {
+				// 		return err
+				// 	}
 			}
 
 			*f.root = *f.local.node.(*Dir)
@@ -1534,7 +1590,7 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
 	// Magic file for returnign the socket path, available in every directory
 	if name == ".blobfs_socket" {
-		return newDebugFile(d.fs.socketPath), nil
+		return newDebugFile([]byte(d.fs.socketPath)), nil
 	}
 
 	// normal lookup operation
@@ -1544,9 +1600,23 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		}
 	}
 
+	var debug bool
+	if strings.HasSuffix(name, debugSuffix) {
+		debug = true
+		name = name[0 : len(name)-len(debugSuffix)]
+	}
+
 	if c, ok := d.Children[name]; ok {
+		// If we are in debug, output the Meta as JSON
+		if debug {
+			hash, js := c.Meta().Json()
+			payload := []byte(hash)
+			payload = append(payload, js...)
+			return newDebugFile(payload), nil
+		}
 		return c, nil
 	}
+
 	return nil, fuse.ENOENT
 }
 
