@@ -51,9 +51,10 @@ import (
 // - a -no-startup-sync flag for offline use?
 // - a -cache mode
 
-const debugSuffix = ".blobfs_debug"
-
-const maxInt = int(^uint(0) >> 1)
+const (
+	debugSuffix = ".blobfs_debug"
+	maxInt      = int(^uint(0) >> 1)
+)
 
 var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 	"ref": func(m *meta.Meta) []byte {
@@ -68,8 +69,10 @@ var virtualXAttrs = map[string]func(*meta.Meta) []byte{
 	// },
 }
 
-var wg sync.WaitGroup
-var bfs *FS
+var (
+	wg  sync.WaitGroup
+	bfs *FS
+)
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -313,6 +316,7 @@ func main() {
 	Log.SetHandler(log15.LvlFilterHandler(lvl, log15.StreamHandler(os.Stdout, log15.TerminalFormat())))
 	fslog := Log.New("name", name)
 
+	// Display stats ever 10 seconds if there was some changes in the FS
 	stats = &Stats{LastReset: time.Now()}
 	go func() {
 		t := time.NewTicker(10 * time.Second)
@@ -325,6 +329,7 @@ func main() {
 			}
 		}
 	}()
+
 	// FIXME(tsileo): re-enable, and do the update only if it's been 10 minutes without any activity
 	// go func() {
 	// 	t := time.NewTicker(10 * time.Minute)
@@ -334,7 +339,7 @@ func main() {
 	// 	}
 	// }()
 
-	sockPath := fmt.Sprintf("/tmp/blobfs_%s_%d.sock", name, time.Now().Unix())
+	sockPath := fmt.Sprintf("/tmp/blobfs_%s_%d.sock", name, time.Now().UnixNano())
 
 	go func() {
 		api := &API{}
@@ -353,7 +358,9 @@ func main() {
 		fslog.Crit("failed to init cache", "err", err)
 		os.Exit(1)
 	}
+
 	kvsOpts := kvstore.DefaultOpts().SetHost(*hostPtr, os.Getenv("BLOBSTASH_API_KEY"))
+	// FIXME(tsileo): re-enable Snappy compression
 	kvsOpts.SnappyCompression = false
 	rkv := kvstore.New(kvsOpts)
 
@@ -413,10 +420,14 @@ func main() {
 		sync:       make(chan struct{}),
 	}
 
+	// Load the Root of the FS before we mount it
 	if err := bfs.loadRoot(); err != nil {
 		panic(err)
 	}
 
+	// Listen for sync request
+	// FIXME(tsileo): we may want this to be async when it's triggered when making a file public,
+	// when the link will be given, it still won't be there remotely and cause issue if done pragmatically
 	go func() {
 		for {
 			select {
@@ -432,6 +443,7 @@ func main() {
 		}
 	}()
 
+	// Actually mount the FS
 	go func() {
 		wg.Add(1)
 		err = fs.Serve(c, bfs)
@@ -453,6 +465,7 @@ func main() {
 		wg.Done()
 	}()
 
+	// Be ready to cleanup if we receive a kill signal
 	cs := make(chan os.Signal, 1)
 	signal.Notify(cs, os.Interrupt,
 		syscall.SIGHUP,
@@ -469,11 +482,12 @@ func main() {
 	os.Exit(0)
 }
 
+// initRoot intializes a new root dir
 func (f *FS) initRoot() (*Dir, error) {
 	newRoot := &Dir{
 		fs:       f,
 		Children: map[string]Node{},
-		meta:     &meta.Meta{Name: ""},
+		meta:     &meta.Meta{Name: ""}, // We want an empty name for the root
 	}
 	newRoot.log = f.log.New("ref", "undefined", "name", "_root", "type", "dir")
 	if err := newRoot.Save(); err != nil {
@@ -506,6 +520,7 @@ func (s *Stats) Reset() {
 	s.DirsUpdated = 0
 	s.updated = false
 }
+
 func (s *Stats) String() string {
 	return fmt.Sprintf("%d files created, %d dirs created, %d files updated, %d dirs updated",
 		s.FilesCreated, s.DirsCreated, s.FilesUpdated, s.DirsUpdated)
@@ -564,6 +579,7 @@ type FS struct {
 	mu sync.Mutex
 }
 
+// Mount determine if the current root should the local one or the remote one and returns it
 func (f *FS) Mount() *Mount {
 	if f.local != nil {
 		if f.remote == nil || (f.remote != nil && f.local.root.Version > f.remote.root.Version) {
@@ -574,6 +590,7 @@ func (f *FS) Mount() *Mount {
 	return f.remote
 }
 
+// Build the local index (a map[path]hash)
 func (f *FS) localIndex() (map[string]string, error) {
 	return f.buildLocalIndex(f.root, "/")
 }
@@ -670,48 +687,6 @@ func (m *Mount) Copy(m2 *Mount) {
 	m2.root = m.root
 }
 
-func DirToStatus(d *Dir) ([]*NodeStatus, map[string]*NodeStatus) {
-	root := []*NodeStatus{}
-	index := map[string]*NodeStatus{}
-	if err := iterDir(d, func(node Node) error {
-		switch n := node.(type) {
-		case *File:
-			path := ""
-			if n.parent.meta.Name != "" {
-				p1 := n.parent
-				for p1.parent != nil {
-					path = filepath.Join(path, p1.meta.Name)
-					p1 = p1.parent
-				}
-			}
-			p := filepath.Join(path, n.meta.Name)
-			nd := &NodeStatus{Type: "file", Path: p, Ref: n.meta.Hash}
-			root = append(root, nd)
-			index[p] = nd
-		case *Dir:
-			path := ""
-			// if n.meta.Name == "_root" {
-			// 	return nil
-			// }
-			if n.parent != nil {
-				p1 := n.parent
-				for p1.parent != nil {
-					path = filepath.Join(path, p1.meta.Name)
-					p1 = p1.parent
-				}
-			}
-			p := filepath.Join(path, n.meta.Name) + "/"
-			nd := &NodeStatus{Type: "dir", Path: p, Ref: n.meta.Hash}
-			root = append(root, nd)
-			index[p] = nd
-		}
-		return nil
-	}); err != nil {
-		panic(err)
-	}
-	return root, index
-}
-
 // Same struct BlobStash's filetree.Node
 // XXX(tsileo): check if we can use a Meta for this? a meta never output hash/ref :s
 type RemoteNode struct {
@@ -724,6 +699,7 @@ type RemoteNode struct {
 	Children []*Node `json:"children,omitempty"`
 }
 
+// remoteNode fetch the remote node at `path` in the given `mutationRef`
 func (f *FS) remoteNode(mutationRef, path string) (*RemoteNode, error) {
 	resp, err := f.bs.Client().DoReq("GET", fmt.Sprintf("/api/filetree/fs/ref/%s/%s", mutationRef, path), nil, nil)
 	if err != nil {
@@ -746,6 +722,7 @@ func (f *FS) remoteNode(mutationRef, path string) (*RemoteNode, error) {
 	}
 }
 
+// remoteIndex fetch the remote index (map[path]hash) for the given mutation ref
 func (f *FS) remoteIndex(ref string) (map[string]string, error) {
 	resp, err := f.bs.Client().DoReq("GET", "/api/filetree/index/"+ref, nil, nil)
 	if err != nil {
@@ -792,8 +769,7 @@ func (f *FS) Refs(rootDir *Dir) ([]string, error) {
 	// rootDir := root.node
 
 	if err := iterDir(rootDir, func(node Node) error {
-		ref := node.Meta().Hash
-		refs = append(refs, ref)
+		refs = append(refs, node.Meta().Hash)
 		if !node.IsDir() {
 			for _, iref := range node.Meta().Refs {
 				data := iref.([]interface{})
@@ -807,7 +783,6 @@ func (f *FS) Refs(rootDir *Dir) ([]string, error) {
 		return nil, err
 	}
 
-	// FIXME(tsileo): ensure the root returned won't change once the FS is modified
 	return refs, nil
 }
 
@@ -1370,7 +1345,7 @@ func NewDir(rfs *FS, m *meta.Meta, parent *Dir) (*Dir, error) {
 
 func (d *Dir) reload() error {
 	// XXX(tsileo): should we assume the Mutex is locked?
-	d.log.Info("Reload")
+	d.log.Info("Reload dir children")
 	d.Children = map[string]Node{}
 	for _, ref := range d.meta.Refs {
 		d.log.Debug("Trying to fetch ref", "hash", ref.(string))
@@ -1470,7 +1445,9 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if d.meta.XAttrs == nil {
 		d.meta.XAttrs = map[string]string{}
 	}
+
 	d.meta.XAttrs[req.Name] = string(req.Xattr)
+
 	if err := d.Save(); err != nil {
 		return err
 	}
@@ -1479,6 +1456,7 @@ func (d *Dir) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 	if req.Name == "public" {
 		bfs.sync <- struct{}{}
 	}
+
 	return nil
 }
 
@@ -1517,7 +1495,7 @@ func (d *Dir) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) err
 
 func (d *Dir) Forget() {
 	d.log.Debug("OP Forget")
-	d.fs.updateLastOP()
+	// For now, this is a noop
 }
 
 func (d *Dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
@@ -1555,6 +1533,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 
 	if node, ok := d.Children[req.OldName]; ok {
 		meta := node.Meta()
+		// FIXME(tsileo): Is the RenameMeta even needed? (it may be bad that it's saving the meta?)
 		if err := d.fs.uploader.RenameMeta(meta, req.NewName); err != nil {
 			return err
 		}
@@ -1571,6 +1550,8 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		if err := d.Save(); err != nil {
 			return err
 		}
+
+		// Also save the dest dir if it was different from the src dir
 		if d != ndir {
 			if err := ndir.Save(); err != nil {
 				return err
@@ -1578,6 +1559,7 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		}
 		return nil
 	}
+
 	return fuse.EIO
 }
 
@@ -1607,7 +1589,7 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	}
 
 	if c, ok := d.Children[name]; ok {
-		// If we are in debug, output the Meta as JSON
+		// If we are in debug, output the Meta as JSON (hash + meta JSON encoded)
 		if debug {
 			hash, js := c.Meta().Json()
 			payload := []byte(hash)
@@ -1639,6 +1621,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		if c.IsDir() {
 			nodeType = fuse.DT_Dir
 		}
+
 		dirs = append(dirs, fuse.Dirent{
 			Inode: 0,
 			Name:  c.Meta().Name,
@@ -1665,20 +1648,31 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		}
 	}
 
+	// Ensure the directory does not already exist
 	if _, ok := d.Children[req.Name]; ok {
 		return nil, fuse.EEXIST
 	}
 
+	// XXX(tsileo): can permissions be set when creating a dir? if so handle it
+
+	// Actually create the dir
 	newdir := &Dir{
 		fs:       d.fs,
 		parent:   d,
 		Children: map[string]Node{},
-		meta:     &meta.Meta{Name: req.Name},
+		// Put only the name in the Meta since when saving it will set oll the needed attrs
+		meta: &meta.Meta{
+			Name: req.Name,
+		},
 	}
 	newdir.log = d.fs.log.New("ref", "unknown", "name", req.Name, "type", "dir")
+
+	// Save it
 	if err := newdir.Save(); err != nil {
 		return nil, err
 	}
+
+	// Make this new the dir the children of its parent
 	d.Children[newdir.meta.Name] = newdir
 	if err := d.Save(); err != nil {
 		return nil, err
@@ -1710,11 +1704,13 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		}
 	}
 
+	// FIXME(tsileo): what happens when trying to remove a file that does not exist?
 	delete(d.Children, req.Name)
 	if err := d.Save(); err != nil {
 		d.log.Error("Failed to saved", "err", err)
 		return err
 	}
+
 	return nil
 }
 
@@ -1722,14 +1718,18 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 // Assumes the caller has acquired the lock
 func (d *Dir) Save() error {
 	d.log.Debug("saving")
+
+	// Create a new Meta and populate it using the previous Meta data
 	m := meta.NewMeta()
 	m.Name = d.meta.Name
 	m.Type = "dir"
 	m.Mode = uint32(os.ModeDir | 0555)
-	m.ModTime = time.Now().Format(time.RFC3339)
 	if d.meta.ModTime != "" {
 		m.ModTime = d.meta.ModTime
+	} else {
+		m.ModTime = time.Now().Format(time.RFC3339)
 	}
+
 	for _, c := range d.Children {
 		switch node := c.(type) {
 		case *Dir:
@@ -1738,22 +1738,25 @@ func (d *Dir) Save() error {
 			m.AddRef(node.meta.Hash)
 		}
 	}
+
+	// Recompute the hash and update the node's meta ref
 	mhash, mjs := m.Json()
 	m.Hash = mhash
 	d.meta = m
-	// if sync {
-	// 	d.log.Debug("sync")
+
 	mexists, err := d.fs.bs.Stat(mhash)
 	if err != nil {
 		d.log.Error("stat failed", "err", err)
 		return err
 	}
+
 	if !mexists {
 		if err := d.fs.bs.Put(mhash, mjs); err != nil {
 			d.log.Error("put failed", "err", err)
 			return err
 		}
 	}
+
 	if d.parent == nil {
 		// If no parent, this is the root so save the ref
 		root := root.New(mhash, 0)
@@ -1767,15 +1770,20 @@ func (d *Dir) Save() error {
 		if err != nil {
 			return err
 		}
+
 		root.Version = kv.Version
 		d.log.Debug("Creating a new VKV entry", "entry", kv)
 
+		// Update the local mount
 		d.fs.local = &Mount{
 			immutable: false,
 			root:      root,
 			node:      d,
 		}
+
 		d.log.Debug("Current root", "root", d.fs.root, "new", d)
+
+		// FIXME(tsileo): should the root be updated??
 		// if d.fs.root != nil {
 		// 	*d.fs.root = *d
 		// }
@@ -1829,6 +1837,8 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 			return nil, nil, err
 		}
 	}
+
+	// Create the file node and set it as the children of the parent
 	f, err := NewFile(d.fs, m, d)
 	if err != nil {
 		return nil, nil, err
@@ -1837,6 +1847,8 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if err := d.Save(); err != nil {
 		return nil, nil, err
 	}
+
+	// XXX(tsileo): track opened file descriptor globally in the FS?
 	f.state.openCount++
 	f.log.Debug("new openCount", "count", f.state.openCount)
 
@@ -1894,6 +1906,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 
 	// Set the updated flag
 	f.state.updated = true
+
 	newLen := req.Offset + int64(len(req.Data))
 	if newLen > int64(maxInt) {
 		return fuse.Errno(syscall.EFBIG)
@@ -1908,6 +1921,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	return nil
 }
 
+// XXX(tsileo): try to get rid of this
 type ClosingBuffer struct {
 	*bytes.Buffer
 }
@@ -1919,6 +1933,8 @@ func (*ClosingBuffer) Close() error {
 func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.log.Debug("OP Flush")
 	f.fs.updateLastOP()
+
+	// Flush is a noop for now
 
 	return nil
 }
@@ -1943,10 +1959,12 @@ func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
 		f.meta.XAttrs = map[string]string{}
 	}
 	f.meta.XAttrs[req.Name] = string(req.Xattr)
+
 	// XXX(tsileo): check thath the parent get the updated hash?
 	if err := f.Save(); err != nil {
 		return err
 	}
+
 	// Trigger a sync so the file will be (un)available for BlobStash right now
 	if req.Name == "public" {
 		bfs.sync <- struct{}{}
@@ -1965,9 +1983,8 @@ func (f *File) Save() error {
 	// Update the new `Meta`
 	f.log.Debug("OP Save", "meta", f.meta)
 	f.parent.fs.uploader.PutMeta(f.meta)
+
 	// And save the parent
-	// f.parent.mu.Lock()
-	// defer f.parent.mu.Unlock()
 	if err := f.parent.Save(); err != nil {
 		return err
 	}
@@ -1985,6 +2002,7 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 	if m.XAttrs == nil {
 		return nil
 	}
+
 	for k, _ := range m.XAttrs {
 		resp.Append(k)
 	}
@@ -1992,6 +2010,7 @@ func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
 	if m.IsPublic() {
 		resp.Append("url")
 	}
+
 	return nil
 }
 
@@ -2007,10 +2026,12 @@ func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *
 
 func (f *File) Forget() {
 	f.log.Debug("OP Forget")
+	// Forget is a noop for now
 }
 
 func handleGetxattr(fs *FS, m *meta.Meta, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	fs.log.Debug("handleGetxattr", "name", req.Name)
+
 	// Check if the request match a virtual extended attributes
 	if xattrFunc, ok := virtualXAttrs[req.Name]; ok && xattrFunc != nil {
 		resp.Xattr = xattrFunc(m)
@@ -2091,8 +2112,8 @@ func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) er
 		if req.Name == "public" {
 			bfs.sync <- struct{}{}
 		}
-		return nil
 
+		return nil
 	}
 
 	return fuse.ErrNoXattr
@@ -2102,6 +2123,7 @@ func (f *File) Size() int {
 	if f.fs.Immutable() || f.data == nil {
 		return f.meta.Size
 	} else {
+		// If the file is open, check the buffer length
 		return len(f.data)
 	}
 }
@@ -2113,7 +2135,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 
-	a.Inode = 0
+	a.Inode = 0 // auto inode
 	a.Mode = os.FileMode(f.meta.Mode)
 	a.Uid = f.fs.uid
 	a.Gid = f.fs.gid
@@ -2143,6 +2165,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 
+	// FIXME(tsileo): implement this
 	//if req.Valid&fuse.SetattrMode != 0 {
 	//if err := os.Chmod(n.path, req.Mode); err != nil {
 	//	return err
@@ -2194,14 +2217,15 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 
 	f.state.openCount++
 	f.log.Debug("open count", "count", f.state.openCount)
+
+	// If it's the first file descriptor for this file, load the file content into a buffer so it can be written
+	// FIXME(tsileo): instead of loading all the file in RAM, create a temporary file at $BLOBFS_WD/$PATH_IN_THE_FS
+	// this way, if there's a power outage/unexpected exception, the WIP won't be loose (like is it right now)
 	if f.state.openCount == 1 && len(f.meta.Refs) > 0 {
-		// if (f.data == nil || len(f.data) == 0) && len(f.meta.Refs) > 0 {
-		// if (req.Flags.IsReadOnly() || req.Flags.IsReadWrite()) && !f.state.updated {
-		f.log.Debug("Creating FakeFile")
+		f.log.Debug("Loading the file in memory")
 		// if !f.fs.Immutable() && f.FakeFile == nil && f.data == nil {
 		// f.log.Debug("Creating FakeFile")
 		f.FakeFile = filereader.NewFile(f.fs.bs, f.meta)
-		// FIXME(tsileo): only if the buffer is small, or load a temp file?
 		var err error
 		f.data, err = ioutil.ReadAll(f.FakeFile)
 		if err != nil {
@@ -2209,6 +2233,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 			return nil, err
 		}
 	}
+
 	return f, nil
 }
 
@@ -2225,6 +2250,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 		f.log.Debug("OP Release END")
 	}()
 
+	// If it's the last file descriptor for this file, then we need to save it
 	if f.state.openCount == 1 {
 		f.log.Debug("Last file descriptor for this node, cleaning up the FakeFile and data")
 		if !f.fs.Immutable() && f.data != nil && len(f.data) > 0 && f.state.updated {
@@ -2262,6 +2288,9 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	f.log.Debug("OP Fsync")
 	f.fs.updateLastOP()
 	// XXX(tsileo): flush the file?
+
+	// This is a noop for now
+
 	return nil
 }
 
@@ -2273,13 +2302,15 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadRe
 	defer f.fs.mu.Unlock()
 
 	if f.data == nil && f.FakeFile == nil {
-		f.log.Debug("Aborting, data or FakeFile is nil")
+		f.log.Debug("Aborting, neither data or FakeFile is init")
 		return nil
 	}
+
 	if req.Offset >= int64(f.Size()) {
 		f.log.Debug("Aborting, out of boundaries offset")
 		return nil
 	}
+
 	if f.fs.Immutable() {
 		f.log.Debug("Reading from FakeFile")
 		buf := make([]byte, req.Size)
