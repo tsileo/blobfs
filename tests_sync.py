@@ -179,6 +179,7 @@ try:
     print 'EDITd21'
     f2_1.edit()
     f2_1.read_and_check()
+
     # f2_1.print_debug()
     # print 'NEW META', f2_1.meta()['hash']
     # print
@@ -194,7 +195,7 @@ try:
     # old_data = blobstash_fs(blobfs2.fs_name, '/'+f2_1.basename)
     print 'blobfs2 sync'
     print blobfs2.cmd('-comment', 'sync #6', 'sync')
-    f2_1.read_and_check()
+    # f2_1.read_and_check()
 
     # print 'HEREHEREHERE'
     # data = blobstash_fs(blobfs2.fs_name, '/'+f2_1.basename)
@@ -204,10 +205,10 @@ try:
 
     print 'blobfs2 sync done'
 
-    print "blobfs1"
-    print blobfs1.cmd('debug')
-    print "blobfs2"
-    print blobfs2.cmd('debug')
+    # print "blobfs1"
+    # print blobfs1.cmd('debug')
+    # print "blobfs2"
+    # print blobfs2.cmd('debug')
 
 
     # # Now back to FS2, also edit f1 to trigger a conflicted
@@ -234,10 +235,10 @@ try:
     f1_6.read_and_check()
 
 
-    print "blobfs1"
-    print blobfs1.cmd('debug')
-    print "blobfs2"
-    print blobfs2.cmd('debug')
+    # print "blobfs1"
+    # print blobfs1.cmd('debug')
+    # print "blobfs2"
+    # print blobfs2.cmd('debug')
 
 
     print 'f1_1 after fetch'
