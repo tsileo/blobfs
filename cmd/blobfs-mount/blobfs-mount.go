@@ -1643,8 +1643,10 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	return fuse.EIO
 }
 
-func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	d.log.Debug("OP Lookup", "name", name)
+func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
+	name := req.Name
+	d.log.Debug("OP Lookup", "name", name, "req", req, "resp", resp)
+	resp.EntryValid = 5 * time.Second
 	d.fs.updateLastOP()
 
 	d.fs.mu.Lock()
