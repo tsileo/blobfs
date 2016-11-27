@@ -618,11 +618,17 @@ type FS struct {
 func (f *FS) InvalidateCache() error {
 	for nodeID, _ := range f.cache {
 		f.log.Debug("Invalidate node", "nodeID", nodeID)
-		if err := f.c.InvalidateNode(nodeID, 0, -1); err != nil && err != fuse.ErrNotCached {
-			f.log.Error("failed to invalidate", "nodeID", nodeID)
+		err := f.c.InvalidateNode(nodeID, 0, -1)
+		switch err {
+		case nil:
+		case fuse.ErrNotCached:
+			f.log.Debug("node not cached")
+		default:
+			f.log.Error("failed to invalidate", "nodeID", nodeID, "err", err)
 		}
 		delete(f.cache, nodeID)
 	}
+	// f.root.Children = nil
 	return nil
 }
 
@@ -1121,6 +1127,10 @@ func (f *FS) createNode(path string, cmeta *meta.Meta) error {
 				return err
 			}
 			node.Children[p] = newd
+			// FIXME(tsileo): needed?
+			if err := node.Save(); err != nil {
+				return err
+			}
 			node = newd
 		}
 	}
