@@ -618,7 +618,7 @@ type FS struct {
 func (f *FS) InvalidateCache() error {
 	for nodeID, _ := range f.cache {
 		f.log.Debug("Invalidate node", "nodeID", nodeID)
-		if err := f.c.InvalidateNode(nodeID, 0, 0); err != nil && err != fuse.ErrNotCached {
+		if err := f.c.InvalidateNode(nodeID, 0, -1); err != nil && err != fuse.ErrNotCached {
 			f.log.Error("failed to invalidate", "nodeID", nodeID)
 		}
 		delete(f.cache, nodeID)
@@ -2345,7 +2345,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 			if err := f.parent.Save(); err != nil {
 				return err
 			}
-			f.log.Debug("new meta2", "meta", f.parent.Children[m2.Name].Meta(), "meta2", f.fs.root.Children[m2.Name].Meta())
+			// f.log.Debug("new meta2", "meta", f.parent.Children[m2.Name].Meta(), "meta2", f.fs.root.Children[m2.Name].Meta())
 
 			// f.log = f.log.New("ref", m2.Hash[:10])
 			f.log.Debug("Flushed", "data_len", len(f.data))
