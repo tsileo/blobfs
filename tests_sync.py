@@ -178,6 +178,7 @@ try:
     # Now both FS1 and FS2 are in sync, edit f1
     print 'EDITd21'
     f2_1.edit()
+    f2_1.read_and_check()
     # f2_1.print_debug()
     # print 'NEW META', f2_1.meta()['hash']
     # print
@@ -185,7 +186,6 @@ try:
 
     f2_6 = root_dir2.create_file(prefix='f6')
     f2_6.read_and_check()
-    f2_1.read_and_check()
 
 
 
