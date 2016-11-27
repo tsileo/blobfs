@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -55,7 +56,7 @@ func isPublic(path string) (bool, error) {
 }
 
 func main() {
-	// commentPtr := flag.String("comment", "", "optional commit comment")
+	commentPtr := flag.String("comment", "", "optional commit comment")
 	publicPtr := flag.Bool("public", false, "share the node publicly (default to semi-private)")
 	// shareTTLPtr := flag.String("share-ttl", "1h", "TTL for the semi-private sharing linl (default to 1h)")
 
@@ -142,11 +143,15 @@ func main() {
 			panic(err)
 		}
 	case "sync", "push":
-		if err := Sync(client, url); err != nil {
+		if err := Sync(client, url, *commentPtr); err != nil {
 			panic(err)
 		}
 	case "fetch", "pull":
 		if err := Pull(client, url); err != nil {
+			panic(err)
+		}
+	case "debug":
+		if err := Debug(client, url); err != nil {
 			panic(err)
 		}
 	case "share":
@@ -290,6 +295,47 @@ func buildStatusIndex(in []string) map[string]struct{} {
 // 	return nil
 // }
 
+func Debug(client http.Client, u string) error {
+	request, err := http.NewRequest("GET", fmt.Sprintf("%s%s", u, "/debug"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	out := map[string]interface{}{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	displayVersion(out, "local")
+	displayVersion(out, "local-remote")
+	displayVersion(out, "remote")
+	// fmt.Printf("out=%+v\n", out)
+	return nil
+}
+
+func displayVersion(out map[string]interface{}, k string) {
+	d := out[k].(map[string]interface{})
+	fmt.Printf("MUTATIONS\n%s=%s\n", k, d["key"])
+	for _, ikv := range d["versions"].([]interface{}) {
+		kv := ikv.(map[string]interface{})
+		fmt.Printf("\tversion=%v\n", int(kv["version"].(float64)))
+		data, err := base64.StdEncoding.DecodeString(kv["data"].(string))
+		if err != nil {
+			panic(err)
+		}
+		root := map[string]interface{}{}
+		if err := json.Unmarshal(data, &root); err != nil {
+			panic(err)
+		}
+		fmt.Printf("\troot=%+v\n\n", root)
+	}
+}
+
 func Pull(client http.Client, u string) error {
 	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/pull"), nil)
 	if err != nil {
@@ -305,8 +351,9 @@ func Pull(client http.Client, u string) error {
 	return nil
 }
 
-func Sync(client http.Client, u string) error {
-	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), nil)
+func Sync(client http.Client, u, comment string) error {
+	fmt.Printf("comment=%s\n", comment)
+	request, err := http.NewRequest("POST", fmt.Sprintf("%s%s", u, "/sync"), bytes.NewReader([]byte(comment)))
 	if err != nil {
 		return err
 	}

@@ -16,7 +16,7 @@ class BlobStash(object):
 
     def run(self):
         """Execute `blobsfs-mount {fs_name} {fs_name}` and return the running process."""
-        self.process = Popen(['blobstash', './tests/blobstash.yaml'], env=os.environ)
+        self.process = Popen(['blobstash', '--loglevel', 'debug', './tests/blobstash.yaml'], env=os.environ)
         time.sleep(1)
         if self.process.poll():
             raise Exception('failed to mount')
@@ -72,7 +72,7 @@ class BlobFS(object):
             process_args.extend(['-loglevel', 'debug'])
         process_args.extend([self.fs_name, mountpoint])
         self.process = Popen(process_args, env=env)
-        time.sleep(1)
+        time.sleep(3)
         if self.process.poll():
             raise Exception('failed to mount')
         with open(os.path.join(self.mnt, '.blobfs_socket')) as f:
@@ -82,7 +82,8 @@ class BlobFS(object):
         cmd = ['blobfs']
         cmd.extend(args)
         print cmd
-        return check_output(cmd, cwd=self.mnt)
+        out = check_output(cmd, cwd=self.mnt)
+        return out
 
     def cleanup(self):
         """Cleanup func."""

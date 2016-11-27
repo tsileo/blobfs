@@ -21,7 +21,6 @@ class File(object):
         self.hexhash = hexhash
         self.basename = os.path.basename(path)
 
-    @property
     def meta(self):
         """Output the file Meta"""
         with open(self.path+'.blobfs_debug') as f:
@@ -40,7 +39,7 @@ size={size}
 mtime={mtime}
 refs={refs}
 ##########
-""".format(**self.meta)
+""".format(**self.meta())
 
     @staticmethod
     def _write_random_data(path, size=FILE_SIZE):

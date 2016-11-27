@@ -142,6 +142,8 @@ try:
 
     f2.print_debug()
 
+    print blobfs.cmd('debug')
+
     # FIXME(tsileo): test to remove a file and check the IOError
 
     # TODO(tsileo): enable this on console flag to "test" new test more easily

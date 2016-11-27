@@ -80,7 +80,7 @@ var Usage = func() {
 	flag.PrintDefaults()
 }
 
-var Log = log15.New()
+var Log = log15.New("logger", "blobfs")
 var stats *Stats
 
 func WriteJSON(w http.ResponseWriter, data interface{}) {
@@ -100,6 +100,7 @@ func (api *API) Serve(socketPath string) error {
 	http.HandleFunc("/ref", apiRefHandler)
 	http.HandleFunc("/sync", apiSyncHandler)
 	http.HandleFunc("/pull", apiPullHandler)
+	http.HandleFunc("/debug", apiDebugHandler)
 	// http.HandleFunc("/log", apiLogHandler)
 	http.HandleFunc("/public", apiPublicHandler)
 	l, err := net.Listen("unix", socketPath)
@@ -151,12 +152,43 @@ type CheckoutReq struct {
 // 	WriteJSON(w, cr)
 // }
 
+func apiDebugHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "GET request expected", http.StatusMethodNotAllowed)
+		return
+	}
+	fsName := fmt.Sprintf(rootKeyFmt, bfs.Name())
+	// Fetch and save all the known remote mutations
+	remoteVersions, err := bfs.rkv.Versions(fsName, 0, -1, 0)
+	if err != nil {
+		panic(err)
+	}
+	localRemoteVersions, err := bfs.lkv.Versions(fsName, 0, -1, 0)
+	if err != nil {
+		panic(err)
+	}
+	localVersions, err := bfs.lkv.Versions(fmt.Sprintf(localRootKeyFmt, bfs.Name()), 0, -1, 0)
+	if err != nil {
+		panic(err)
+	}
+	WriteJSON(w, map[string]interface{}{
+		"remote":       remoteVersions,
+		"local-remote": localRemoteVersions,
+		"local":        localVersions,
+	})
+
+}
+
 func apiSyncHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "POST request expected", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := bfs.Push(); err != nil {
+	comment, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		panic(err)
+	}
+	if err := bfs.Push(comment); err != nil {
 		panic(err)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -417,6 +449,7 @@ func main() {
 		uploader:   writer.NewUploader(bs),
 		immutable:  *immutablePtr,
 		host:       bsOpts.Host,
+		cache:      map[fuse.NodeID]struct{}{},
 		sync:       make(chan struct{}),
 	}
 
@@ -436,7 +469,7 @@ func main() {
 				if err := bfs.Pull(); err != nil {
 					fslog.Error("failed to push", "err", err)
 				}
-				if err := bfs.Push(); err != nil {
+				if err := bfs.Push(nil); err != nil {
 					fslog.Error("failed to push", "err", err)
 				}
 			}
@@ -576,7 +609,21 @@ type FS struct {
 	uid uint32 // Current user uid
 	gid uint32 // Current user gid
 
-	mu sync.Mutex
+	cache map[fuse.NodeID]struct{}
+
+	openFds int // Open file descriptors count
+	mu      sync.Mutex
+}
+
+func (f *FS) InvalidateCache() error {
+	for nodeID, _ := range f.cache {
+		f.log.Debug("Invalidate node", "nodeID", nodeID)
+		if err := f.c.InvalidateNode(nodeID, 0, 0); err != nil && err != fuse.ErrNotCached {
+			f.log.Error("failed to invalidate", "nodeID", nodeID)
+		}
+		delete(f.cache, nodeID)
+	}
+	return nil
 }
 
 // Mount determine if the current root should the local one or the remote one and returns it
@@ -748,7 +795,7 @@ func (f *FS) remoteIndex(ref string) (map[string]string, error) {
 // Refs returns a "snapshot" of the FS
 // - a slice of refs containing all the blobfs of the Tree
 func (f *FS) Refs(rootDir *Dir) ([]string, error) {
-	f.log.Info("Fetching refs", "root", rootDir)
+	f.log.Info("Fetching refs", "root", rootDir, "meta", rootDir.Meta())
 	defer f.log.Info("Fetching refs done")
 
 	wg.Add(1)
@@ -769,6 +816,7 @@ func (f *FS) Refs(rootDir *Dir) ([]string, error) {
 	// rootDir := root.node
 
 	if err := iterDir(rootDir, func(node Node) error {
+		f.log.Debug("[fetch dir]", "node", node.Meta())
 		refs = append(refs, node.Meta().Hash)
 		if !node.IsDir() {
 			for _, iref := range node.Meta().Refs {
@@ -837,35 +885,39 @@ func (f *FS) Pull() error {
 
 	switch {
 	case localKv == nil:
-		if remoteKv != nil {
-			// Fetch and save all the known remote mutations
-			versions, err := f.rkv.Versions(fsName, 0, -1, 0)
-			if err != nil {
+		// FIXME(tsileo): is this case even possible?
+		f.log.Debug("No local mutations yet")
+		if remoteKv == nil {
+			panic("shouldn't happen")
+		}
+		// Fetch and save all the known remote mutations
+		versions, err := f.rkv.Versions(fsName, 0, -1, 0)
+		if err != nil {
+			return err
+		}
+		for _, version := range versions.Versions {
+			f.log.Debug("Saving mutation locally", "root", string(version.Data))
+			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
 				return err
 			}
-			for _, version := range versions.Versions {
-				f.log.Debug("Saving mutation locally", "root", string(version.Data))
-				if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
-					return err
-				}
-			}
-			f.remote = &Mount{
-				immutable: f.Immutable(),
-				root:      remoteRoot,
-				node:      remoteNode,
-			}
-			*f.root = *remoteNode.(*Dir)
-			// if err := bfs.c.InvalidateEntry(fuse.RootID, ""); err != nil {
-			// 	f.log.Error("failed to invalidate entry", "err", err)
-			// 	return err
-			// }
-			return nil
 		}
+		f.remote = &Mount{
+			immutable: f.Immutable(),
+			root:      remoteRoot,
+			node:      remoteNode,
+		}
+		*f.root = *remoteNode.(*Dir)
+		// if err := bfs.c.InvalidateEntry(fuse.RootID, ""); err != nil {
+		// 	f.log.Error("failed to invalidate entry", "err", err)
+		// 	return err
+		// }
+		return f.InvalidateCache()
 
 	case remoteKv == nil:
 		f.log.Info("FS does not exist remotely")
 
 	case remoteKv.Version > localKv.Version:
+		f.log.Info("there are un-synced remote mutations")
 		// No un-synced mutation, just copy the new mutations
 		// versions, err := f.rkv.Versions(fsName, localKv.Version-1, -1, 0)
 		versions, err := f.rkv.Versions(fsName, 0, -1, 0)
@@ -885,6 +937,7 @@ func (f *FS) Pull() error {
 			if f.remote != nil && version.Version == f.remote.root.Version {
 				shouldBreak = true
 				// This mean we should catch the version as the previous ref
+				continue
 			}
 			if f.lkv.Put(fsName, version.Hash, version.Data, version.Version); err != nil {
 				return err
@@ -892,7 +945,7 @@ func (f *FS) Pull() error {
 			saved++
 		}
 
-		f.log.Debug("Remote mutation saved", "count", saved)
+		f.log.Info("Remote mutations saved", "count", saved)
 
 		// FIXME(tsileo): check here too
 		// Check we have mutation not synced yet
@@ -912,7 +965,7 @@ func (f *FS) Pull() error {
 			if err != nil {
 				return err
 			}
-			f.log.Info("Built remote index", "index", localIndex)
+			f.log.Info("Built local index", "index", localIndex)
 
 			// Compute the diff between the two mutations
 			diff, err := f.compareIndex(localIndex, remoteIndex)
@@ -957,7 +1010,7 @@ func (f *FS) Pull() error {
 				// rnode, err := f.remoteNode()
 				f.log.Debug("[deleted *candidate*]", "node", deletedCandidate)
 				// 	f.log.Info("[deleted]", "node", deleted)
-				// 	// FIXME(tsileo): detect new file/unsynced file/if the deleted file has been modified
+				// 	// FIXME(tsileo): detect new file/unsynced file/if the deleted file has been modified"
 				// 	// XXX(tsileo): should check the latest remote (from local rkv) and see if the file is the same
 				// 	// in this case delete it, if not ???
 				// 	if err := f.deleteNode(deleted.Path); err != nil {
@@ -965,10 +1018,16 @@ func (f *FS) Pull() error {
 				// 	}
 			}
 
+			// FIXME(tsileo): bad root here?
+			// f.remote = &Mount{
+			// 	immutable: f.Immutable(),
+			// 	node:
+			// }
+
 			*f.root = *f.local.node.(*Dir)
 			f.log.Info("Diff done")
 
-			return nil
+			return f.InvalidateCache()
 		}
 
 		f.remote = &Mount{
@@ -982,9 +1041,10 @@ func (f *FS) Pull() error {
 		return fmt.Errorf("BlobStash seems out of sync")
 	case localKv.Version == remoteKv.Version:
 		f.log.Info("Already in sync")
+		return nil
 	}
 
-	return nil
+	return f.InvalidateCache()
 }
 
 func (f *FS) metaFromHash(hash string) (*meta.Meta, error) {
@@ -1068,8 +1128,8 @@ func (f *FS) createNode(path string, cmeta *meta.Meta) error {
 }
 
 // Push saves all the blobs of the tree, and add the VK entry to the remote BlobStash instance
-func (f *FS) Push() error {
-	f.log.Info("Pushing data")
+func (f *FS) Push(comment []byte) error {
+	f.log.Info("Pushing data", "comment", comment)
 
 	wg.Add(1)
 	defer wg.Done()
@@ -1080,9 +1140,16 @@ func (f *FS) Push() error {
 		return nil
 	}
 
-	// Check if the latest remote mutation
+	// Try to fetch the latest remote mutation
 	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
 	remoteKv, err := f.rkv.Get(fsName, -1)
+	// versions, err2 := f.rkv.Versions(fsName, 0, -1, 0)
+	// if err2 != nil && err2 != kvstore.ErrKeyNotFound {
+	// 	panic(err)
+	// }
+	// if versions != nil {
+	// 	fmt.Printf("DEBUG:%+v/\n%+v/\n%+v/\n%+v\n\n", remoteKv, versions.Versions[0], f.remote.root, f.remote.node)
+	// }
 	switch err {
 	case nil:
 		// There are mutations for this FS in BlobStash
@@ -1091,9 +1158,9 @@ func (f *FS) Push() error {
 		if err != nil {
 			return err
 		}
-		// FIXME(tsileo): better way to check
-		// if remoteRoot.Ref != f.remote.root.Ref {
-		// 	f.log.Error("conflicted")
+		// FIXME(tsileo): compare with lkv instead f.remote
+		// if f.remote.root != nil && f.remote.root.Ref != remoteRoot.Ref {
+		// 	f.log.Error("conflicted", "local_remote_root", f.remote.root, "remote_root", remoteRoot)
 		// 	// FIXME(tsileo): return conflicted error asking to pull
 		// 	return nil
 		// }
@@ -1108,12 +1175,15 @@ func (f *FS) Push() error {
 	stats := &SyncStats{}
 	defer f.log.Info("Push done", "blobs_uploaded", stats.BlobsUploaded, "blobs_skipped", stats.BlobsSkipped)
 
-	rootNode := f.local.node
+	// rootNode := f.root
 
-	rootDir := rootNode.(*Dir)
+	// rootDir := f.local.node.(*Dir) //rootNode.(*Dir)
 	croot := f.local.root
+	if comment != nil {
+		croot.Comment = string(comment)
+	}
 
-	refs, err := bfs.Refs(rootDir)
+	refs, err := bfs.Refs(f.root)
 	if err != nil {
 		return err
 	}
@@ -1784,9 +1854,9 @@ func (d *Dir) Save() error {
 		d.log.Debug("Current root", "root", d.fs.root, "new", d)
 
 		// FIXME(tsileo): should the root be updated??
-		// if d.fs.root != nil {
-		// 	*d.fs.root = *d
-		// }
+		if d.fs.root != nil {
+			*d.fs.root = *d
+		}
 	} else {
 		// d.parent.mu.Lock()
 		// defer d.parent.mu.Unlock()
@@ -1850,7 +1920,8 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	// XXX(tsileo): track opened file descriptor globally in the FS?
 	f.state.openCount++
-	f.log.Debug("new openCount", "count", f.state.openCount)
+	f.fs.openFds++
+	f.log.Debug("new openCount", "count", f.state.openCount, "global", f.fs.openFds)
 
 	stats.Lock()
 	stats.updated = true
@@ -1981,14 +2052,11 @@ func (f *File) Save() error {
 	}
 
 	// Update the new `Meta`
-	f.log.Debug("OP Save", "meta", f.meta)
-	f.parent.fs.uploader.PutMeta(f.meta)
+	f.log.Debug("OP Save (file)", "meta", f.meta)
+	// f.parent.fs.uploader.PutMeta(f.meta)
 
 	// And save the parent
-	if err := f.parent.Save(); err != nil {
-		return err
-	}
-	return nil
+	return f.parent.Save()
 }
 
 func handleListxattr(m *meta.Meta, resp *fuse.ListxattrResponse) error {
@@ -2216,7 +2284,14 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenRe
 	defer f.fs.mu.Unlock()
 
 	f.state.openCount++
-	f.log.Debug("open count", "count", f.state.openCount)
+	f.fs.openFds++
+	f.log.Debug("open count", "count", f.state.openCount, "global", f.fs.openFds)
+
+	f.fs.cache[req.Header.Node] = struct{}{}
+	f.log.Debug("current node cache", "cache", f.fs.cache)
+
+	// Bypass page cache
+	res.Flags |= fuse.OpenDirectIO
 
 	// If it's the first file descriptor for this file, load the file content into a buffer so it can be written
 	// FIXME(tsileo): instead of loading all the file in RAM, create a temporary file at $BLOBFS_WD/$PATH_IN_THE_FS
@@ -2246,7 +2321,8 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 
 	defer func() {
 		f.state.openCount--
-		f.log.Debug("new openCount", "count", f.state.openCount)
+		f.fs.openFds--
+		f.log.Debug("new openCount", "count", f.state.openCount, "global", f.fs.openFds)
 		f.log.Debug("OP Release END")
 	}()
 
@@ -2266,9 +2342,10 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 			// f.parent.mu.Lock()
 			// defer f.parent.mu.Unlock()
 			f.meta = m2
-			if err := f.Save(); err != nil {
+			if err := f.parent.Save(); err != nil {
 				return err
 			}
+			f.log.Debug("new meta2", "meta", f.parent.Children[m2.Name].Meta(), "meta2", f.fs.root.Children[m2.Name].Meta())
 
 			// f.log = f.log.New("ref", m2.Hash[:10])
 			f.log.Debug("Flushed", "data_len", len(f.data))
