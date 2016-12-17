@@ -25,10 +25,12 @@ import (
 	"github.com/tsileo/blobfs/pkg/cache"
 	"github.com/tsileo/blobfs/pkg/pathutil"
 	"github.com/tsileo/blobfs/pkg/root"
+	"gopkg.in/yaml.v2"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"bazil.org/fuse/fuseutil"
+	"github.com/tsileo/blobstash/pkg/apps/app"
 	"github.com/tsileo/blobstash/pkg/client/blobstore"
 	"github.com/tsileo/blobstash/pkg/client/kvstore"
 	"github.com/tsileo/blobstash/pkg/filetree/filetreeutil/meta"
@@ -316,6 +318,36 @@ func unmount(mountpoint string) error {
 	}
 }
 
+type AppYAML struct {
+	Name       string                 `yaml:"name"`
+	EntryPoint *app.EntryPoint        `yaml"entrypoint"`
+	Config     map[string]interface{} `yaml:"config"`
+}
+
+type AppNode struct {
+	fs   *FS
+	meta *meta.Meta
+}
+
+func (an *AppNode) Reader() app.ReadSeekCloser {
+	ff := filereader.NewFile(bfs.bs, an.meta)
+	fmt.Printf("FF=%+v\n", ff)
+	return ff
+}
+
+func (an *AppNode) Name() string {
+	return an.meta.Name
+}
+
+func (an *AppNode) IsDir() bool {
+	return an.meta.IsDir()
+}
+
+func (an *AppNode) ModTime() time.Time {
+	mtime, _ := an.meta.Mtime()
+	return mtime
+}
+
 func main() {
 	hostPtr := flag.String("host", "", "remote host, default to http://localhost:8050")
 	loglevelPtr := flag.String("loglevel", "info", "logging level (debug|info|warn|crit)")
@@ -457,7 +489,52 @@ func main() {
 	if err := bfs.loadRoot(); err != nil {
 		panic(err)
 	}
+	bfs.root = bfs.Mount().node.(*Dir)
 
+	appConfigYAML, err := bfs.Path("/app.yaml")
+	if err != nil {
+		panic(err)
+	}
+	if appConfigYAML != nil {
+		fakeFile := filereader.NewFile(bfs.bs, appConfigYAML.Meta())
+		data, err := ioutil.ReadAll(fakeFile)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("YAML data=%s", data)
+		appConf := &AppYAML{}
+		if err := yaml.Unmarshal(data, &appConf); err != nil {
+			panic(err)
+		}
+		fmt.Printf("YAML data=%+v", appConf)
+
+		// func New(name string, entrypoint *EntryPoint, config map[string]interface{}, pathFunc func(string) (AppNode, error), authFunc func(*http.Request) bool) *App {
+		pathFunc := func(path string) (app.AppNode, error) {
+			node, err := bfs.Path(path)
+			if err != nil {
+				panic(err)
+
+			}
+			if node != nil {
+				return &AppNode{
+					fs:   bfs,
+					meta: node.Meta(),
+				}, err
+			}
+
+			return nil, nil
+		}
+
+		bfs.app = app.New(appConf.Name, appConf.EntryPoint, appConf.Config, pathFunc, nil)
+		h := func(w http.ResponseWriter, r *http.Request) {
+			bfs.app.Serve(context.TODO(), w, r)
+		}
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", h)
+			http.ListenAndServe(":8030", mux)
+		}()
+	}
 	// Listen for sync request
 	// FIXME(tsileo): we may want this to be async when it's triggered when making a file public,
 	// when the link will be given, it still won't be there remotely and cause issue if done pragmatically
@@ -606,6 +683,8 @@ type FS struct {
 
 	c *fuse.Conn
 
+	app *app.App
+
 	uid uint32 // Current user uid
 	gid uint32 // Current user gid
 
@@ -641,6 +720,40 @@ func (f *FS) Mount() *Mount {
 		return f.remote
 	}
 	return f.remote
+}
+
+func (f *FS) Path(lp string) (Node, error) {
+	return f.path(f.root, lp, "/")
+}
+
+func (f *FS) path(n Node, lp, p string) (Node, error) {
+	if n.IsDir() {
+		d := n.(*Dir)
+		if d.Children == nil {
+			if err := d.reload(); err != nil {
+				return nil, err
+			}
+		}
+		for _, child := range d.Children {
+
+			childPath := filepath.Join(p, n.Meta().Name, child.Meta().Name)
+			if child.IsDir() {
+				rnode, err := f.path(child, lp, filepath.Join(p, n.Meta().Name))
+				if err != nil {
+					return nil, err
+				}
+				if rnode != nil && childPath == lp {
+					return rnode, nil
+				}
+
+			} else {
+				if childPath == lp {
+					return child, nil
+				}
+			}
+		}
+	}
+	return nil, nil
 }
 
 // Build the local index (a map[path]hash)
@@ -894,7 +1007,30 @@ func (f *FS) Pull() error {
 		// FIXME(tsileo): is this case even possible?
 		f.log.Debug("No local mutations yet")
 		if remoteKv == nil {
-			panic("shouldn't happen")
+			newRoot, err := f.initRoot()
+			if err != nil {
+				return err
+			}
+			rootNode := newRoot
+			// The root was just created
+			localRoot := &root.Root{Ref: rootNode.Meta().Hash}
+			jsroot, err := localRoot.JSON()
+			if err != nil {
+				return err
+			}
+			localFsName := fmt.Sprintf(localRootKeyFmt, f.Name())
+			kv, err := f.lkv.Put(localFsName, "", jsroot, -1)
+			localRoot.Version = kv.Version
+			if err != nil {
+				return err
+			}
+			f.local = &Mount{
+				immutable: false,
+				root:      localRoot,
+				node:      newRoot,
+			}
+			f.root = f.Mount().node.(*Dir)
+			return nil
 		}
 		// Fetch and save all the known remote mutations
 		versions, err := f.rkv.Versions(fsName, 0, -1, 0)
@@ -912,7 +1048,12 @@ func (f *FS) Pull() error {
 			root:      remoteRoot,
 			node:      remoteNode,
 		}
-		*f.root = *remoteNode.(*Dir)
+		f.log.Debug("DEBUG", "f.root", f.root, "remoteDir", remoteNode)
+		if f.root != nil {
+			*f.root = *remoteNode.(*Dir)
+		} else {
+			f.root = remoteNode.(*Dir)
+		}
 		// if err := bfs.c.InvalidateEntry(fuse.RootID, ""); err != nil {
 		// 	f.log.Error("failed to invalidate entry", "err", err)
 		// 	return err
@@ -1288,6 +1429,7 @@ func (f *FS) kvDataToDir(data []byte, version int) (*root.Root, *Dir, error) {
 
 func (f *FS) loadRoot() error {
 	// First, try to fetch the local root
+	// return f.Pull()
 	var err error
 	var localRoot, remoteRoot *root.Root
 	var localNode, remoteNode, rootNode Node
