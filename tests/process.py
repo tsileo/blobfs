@@ -1,4 +1,5 @@
 # coding: utf-8
+from contextlib import contextmanager
 from subprocess import Popen
 from subprocess import check_output
 import tempfile
@@ -77,6 +78,18 @@ class BlobFS(object):
             raise Exception('failed to mount')
         with open(os.path.join(self.mnt, '.blobfs_socket')) as f:
             self.socket_path = f.read()
+
+    @contextmanager
+    def mount_ctx(self, mountpoint=None, debug=False, remove_data=False):
+        self.mount(mountpoint=mountpoint, debug=debug)
+        try:
+            yield self
+        finally:
+            self.unmount()
+            self.cleanup()
+            if remove_data:
+                self.remove_data()
+
 
     def cmd(self, *args):
         cmd = ['blobfs']

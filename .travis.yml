@@ -15,4 +15,3 @@ script:
   - go install github.com/tsileo/blobstash
   - go test -v ./...
   - python tests_basic.py
-  - python tests_sync.py

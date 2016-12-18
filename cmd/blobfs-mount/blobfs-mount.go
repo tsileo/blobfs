@@ -320,7 +320,7 @@ func unmount(mountpoint string) error {
 
 type AppYAML struct {
 	Name       string                 `yaml:"name"`
-	EntryPoint *app.EntryPoint        `yaml"entrypoint"`
+	EntryPoint *app.EntryPoint        `yaml:"entrypoint"`
 	Config     map[string]interface{} `yaml:"config"`
 }
 
@@ -1431,17 +1431,27 @@ func (f *FS) loadRoot() error {
 	// First, try to fetch the local root
 	// return f.Pull()
 	var err error
-	var localRoot, remoteRoot *root.Root
-	var localNode, remoteNode, rootNode Node
+	var wipRoot, localRoot, remoteRoot *root.Root
+	var wipNode, localNode, remoteNode, rootNode Node
 
 	fsName := fmt.Sprintf(rootKeyFmt, f.Name())
 	localFsName := fmt.Sprintf(localRootKeyFmt, f.Name())
 
-	f.log.Debug("load latest remote mutation")
+	f.log.Debug("load latest local mutation")
 	localKv, err := f.lkv.Get(fsName, -1)
 	switch err {
 	case nil:
 		localRoot, localNode, err = f.kvDataToDir(localKv.Data, localKv.Version)
+	case vkv.ErrNotFound:
+	default:
+		return err
+	}
+
+	f.log.Debug("load latest wip mutation")
+	wipKv, err := f.lkv.Get(localFsName, -1)
+	switch err {
+	case nil:
+		wipRoot, wipNode, err = f.kvDataToDir(wipKv.Data, wipKv.Version)
 	case vkv.ErrNotFound:
 	default:
 		return err
@@ -1460,6 +1470,15 @@ func (f *FS) loadRoot() error {
 	default:
 		f.log.Error("failed to fetch lastest mutation from BlobStash", "err", err)
 		return err
+	}
+	if wipKv != nil && ((localKv == nil && remoteKv == nil) || (remoteKv != nil && localKv == nil && wipKv.Version > remoteKv.Version) || (localKv != nil && remoteKv != nil && wipKv.Version > localKv.Version && wipKv.Version > remoteKv.Version)) {
+		f.local = &Mount{
+			immutable: f.Immutable(),
+			node:      wipNode,
+			root:      wipRoot,
+		}
+		f.root = f.Mount().node.(*Dir)
+		return nil
 	}
 	switch {
 	case localKv == nil && remoteKv == nil:

@@ -27,122 +27,121 @@ blobstash.run()
 
 blobfs = BlobFS()
 
-blobfs.mount(debug=DEBUG)
-mnt = blobfs.mnt
-
 try:
-    root_dir = Dir(mnt)
+    with blobfs.mount_ctx(debug=DEBUG, remove_data=True):
+        mnt = blobfs.mnt
+        root_dir = Dir(mnt)
 
-    # Ensure the directory is empty
-    assert len(root_dir.list()) == 0
+        # Ensure the directory is empty
+        assert len(root_dir.list()) == 0
 
-    # Create a file
-    f1 = root_dir.create_file()
-    # time.sleep(0.5)
-    # Ensure we can see the newly created file in the root dir
-    assert root_dir.list() == [f1.basename]
+        # Create a file
+        f1 = root_dir.create_file()
+        # time.sleep(0.5)
+        # Ensure we can see the newly created file in the root dir
+        assert root_dir.list() == [f1.basename]
 
-    f1.read_and_check()
+        f1.read_and_check()
 
-    # Edit the file
-    f1.edit()
-    # time.sleep(0.5)
+        # Edit the file
+        f1.edit()
+        # time.sleep(0.5)
 
-    f1.read_and_check()
+        f1.read_and_check()
 
-    f3_name = random_name()
-    f3_content = 'testing'
-    with open(os.path.join(mnt, f3_name), 'wb+') as f3:
-        f3.write(f3_content)
-        f3.flush()
-        # time.sleep(1)
+        f3_name = random_name()
+        f3_content = 'testing'
+        with open(os.path.join(mnt, f3_name), 'wb+') as f3:
+            f3.write(f3_content)
+            f3.flush()
+            # time.sleep(1)
 
-        # Ensure we can see the content after the flush if we open the file again
-        with open(os.path.join(mnt, f3_name)) as f3ro:
-            f3ro_content = f3ro.read()
-            print f3ro_content, f3_content
-            assert f3ro_content == f3_content
+            # Ensure we can see the content after the flush if we open the file again
+            with open(os.path.join(mnt, f3_name)) as f3ro:
+                f3ro_content = f3ro.read()
+                print f3ro_content, f3_content
+                assert f3ro_content == f3_content
 
-        f3.write(f3_content)
+            f3.write(f3_content)
 
-        # FIXME(tsileo): ensure f1_1
+            # FIXME(tsileo): ensure f1_1
 
-    with open(os.path.join(mnt, f3_name)) as f3:
-        assert f3.read() == f3_content * 2
+        with open(os.path.join(mnt, f3_name)) as f3:
+            assert f3.read() == f3_content * 2
 
-    assert len(root_dir.list()) == 2
+        assert len(root_dir.list()) == 2
 
-    d1 = root_dir.create_dir()
-    # time.sleep(0.5)
+        d1 = root_dir.create_dir()
+        # time.sleep(0.5)
 
-    # Ensure the file is created
-    assert len(root_dir.list()) == 3
+        # Ensure the file is created
+        assert len(root_dir.list()) == 3
 
-    # Check that we get EEXIST (17) error when creating a file that already exists
-    eraised = False
-    try:
-        root_dir.create_dir(name=d1.basename)
-    except OSError as exc:
-        eraised = True
-        assert exc.errno == 17
+        # Check that we get EEXIST (17) error when creating a file that already exists
+        eraised = False
+        try:
+            root_dir.create_dir(name=d1.basename)
+        except OSError as exc:
+            eraised = True
+            assert exc.errno == 17
 
-    assert eraised
+        assert eraised
 
-    # Check that a non-existing file return ENOENT (2)
-    eraised = False
-    try:
-        open('itdoesnotexist')
-    except IOError as exc:
-        eraised = True
-        assert exc.errno == 2
+        # Check that a non-existing file return ENOENT (2)
+        eraised = False
+        try:
+            open('itdoesnotexist')
+        except IOError as exc:
+            eraised = True
+            assert exc.errno == 2
 
-    assert eraised
+        assert eraised
 
-    f2 = d1.create_file()
-    # time.sleep(0.5)
+        f2 = d1.create_file()
+        # time.sleep(0.5)
 
-    f2.read_and_check()
+        f2.read_and_check()
 
-    f2.move(os.path.join(mnt, random_name()))
-    # time.sleep(0.5)
+        f2.move(os.path.join(mnt, random_name()))
+        # time.sleep(0.5)
 
-    assert len(root_dir.list()) == 4
+        assert len(root_dir.list()) == 4
 
-    f2.read_and_check()
+        f2.read_and_check()
 
-    f2.move(os.path.join(mnt, d1.basename, random_name()))
-    # time.sleep(0.5)
+        f2.move(os.path.join(mnt, d1.basename, random_name()))
+        # time.sleep(0.5)
 
-    assert len(root_dir.list()) == 3
+        assert len(root_dir.list()) == 3
 
-    f2.read_and_check()
+        f2.read_and_check()
 
 
-    print 'sync'
-    print blobfs.cmd('sync')
+        print 'sync'
+        print blobfs.cmd('sync')
 
     print 'restart'
-    blobfs.restart(remove_data=True)
+    with blobfs.mount_ctx(debug=DEBUG, remove_data=True):
 
-    f1.read_and_check()
-    f2.read_and_check()
+        f1.read_and_check()
+        f2.read_and_check()
 
-    assert len(root_dir.list()) == 3
+        assert len(root_dir.list()) == 3
 
-    os.remove(f1.path)
+        os.remove(f1.path)
 
-    eraised = False
-    try:
-        open(f1.path)
-    except IOError as exc:
-        eraised = True
-        assert exc.errno == 2
+        eraised = False
+        try:
+            open(f1.path)
+        except IOError as exc:
+            eraised = True
+            assert exc.errno == 2
 
-    assert eraised
+        assert eraised
 
-    f2.print_debug()
+        f2.print_debug()
 
-    print blobfs.cmd('debug')
+        print blobfs.cmd('debug')
 
     # FIXME(tsileo): test to remove a file and check the IOError
 
@@ -153,8 +152,5 @@ except Exception, exc:
     logging.exception('failed')
     print exc
 finally:
-    blobfs.unmount()
-    blobfs.cleanup()
-    blobfs.remove_data()
     os.rmdir(mnt)
     blobstash.shutdown()
