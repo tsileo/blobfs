@@ -1,6 +1,6 @@
 # BlobFS
 
-[![Travis](https://img.shields.io/travis/tsileo/blobfs.svg?maxAge=2592000)](https://travis-ci.org/tsileo/blobfs)
+A new version of this project is available here: https://git.sr.ht/~tsileo/blobfs
 
 A FUSE file system built on top of [BlobStash](https://github.com/tsileo/blobstash) with built-in sync and deduplication.
 
